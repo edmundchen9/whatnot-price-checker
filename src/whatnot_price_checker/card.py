@@ -14,17 +14,32 @@ def _order_quad(pts: np.ndarray) -> np.ndarray:
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
 
-def find_card_warp(
+def _crop_region(
+    frame_bgr: np.ndarray,
+    x0: float,
+    x1: float,
+    y0: float,
+    y1: float,
+) -> np.ndarray:
+    """Crop a fractional region from the frame."""
+    h, w = frame_bgr.shape[:2]
+    px0 = max(0, int(w * x0))
+    px1 = min(w, int(w * x1))
+    py0 = max(0, int(h * y0))
+    py1 = min(h, int(h * y1))
+    crop = frame_bgr[py0:py1, px0:px1]
+    if crop.size == 0:
+        return frame_bgr
+    return crop
+
+
+def _find_card_contour(
     frame_bgr: np.ndarray,
     *,
     min_area_ratio: float = 0.02,
     max_area_ratio: float = 0.95,
-    out_width: int = 350,
+    out_width: int = 420,
 ) -> np.ndarray | None:
-    """
-    Find the largest quadrilateral contour and return a perspective-warped card.
-    Pokemon cards are ~63:88 width:height; output height is derived from out_width.
-    """
     h, w = frame_bgr.shape[:2]
     area_img = float(h * w)
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -62,3 +77,38 @@ def find_card_warp(
     )
     m = cv2.getPerspectiveTransform(ordered, dst)
     return cv2.warpPerspective(frame_bgr, m, (out_width, out_h))
+
+
+def _resize_to_card(frame_bgr: np.ndarray, out_width: int = 420) -> np.ndarray:
+    """Resize any region to standard card dimensions for OCR."""
+    out_h = int(round(out_width * 88.0 / 63.0))
+    h, w = frame_bgr.shape[:2]
+    interp = cv2.INTER_CUBIC if (h < out_h or w < out_width) else cv2.INTER_AREA
+    return cv2.resize(frame_bgr, (out_width, out_h), interpolation=interp)
+
+
+def warp_for_ocr(
+    frame_bgr: np.ndarray,
+    *,
+    min_area_ratio: float = 0.02,
+    max_area_ratio: float = 0.95,
+    out_width: int = 420,
+) -> tuple[np.ndarray | None, str]:
+    """
+    Try contour-based card detection on the frame.
+    If that fails, resize the whole frame to card dimensions.
+    Returns (image, source) with source 'outline', 'frame', or 'none'.
+    """
+    if frame_bgr.size == 0 or frame_bgr.shape[0] < 64 or frame_bgr.shape[1] < 64:
+        return None, "none"
+
+    outlined = _find_card_contour(
+        frame_bgr,
+        min_area_ratio=min_area_ratio,
+        max_area_ratio=max_area_ratio,
+        out_width=out_width,
+    )
+    if outlined is not None:
+        return outlined, "outline"
+
+    return _resize_to_card(frame_bgr, out_width), "frame"

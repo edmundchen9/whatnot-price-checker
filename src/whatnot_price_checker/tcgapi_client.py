@@ -15,9 +15,14 @@ class TcgApiQuote:
     name: str
     set_name: str
     printing: str
+    rarity: str
+    number: str
+    product_type: str
+    foil_only: int
     market_price: float | None
     low_price: float | None
     median_price: float | None
+    total_listings: int | None
     product_id: int | None
     rate_limit_remaining: int | None
     rate_limit_reset: str | None
@@ -77,9 +82,14 @@ class TcgApiClient:
             name=str(row.get("name") or ""),
             set_name=str(row.get("set_name") or ""),
             printing=str(row.get("printing") or pref),
+            rarity=str(row.get("rarity") or ""),
+            number=str(row.get("number") or ""),
+            product_type=str(row.get("product_type") or ""),
+            foil_only=_safe_int(row.get("foil_only")),
             market_price=_to_float(row.get("market_price")),
             low_price=_to_float(row.get("low_price")),
             median_price=_to_float(row.get("median_price")),
+            total_listings=_to_int(row.get("total_listings")),
             product_id=_to_int(row.get("id")),
             rate_limit_remaining=_to_int(rl_meta.get("daily_remaining")),
             rate_limit_reset=str(rl_meta.get("daily_reset") or "") or None,

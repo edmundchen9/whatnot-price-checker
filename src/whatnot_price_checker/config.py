@@ -36,6 +36,15 @@ class Settings:
     tcgapi_per_page: int = 25
     price_cache_ttl_sec: float = 86400.0
     foil_ratio_threshold: float = 1.65
+    # Video region crop — fraction of the captured browser window.
+    # Whatnot puts the video player on the right; chat/sidebar is on the left.
+    # Tweak with WPC_CROP_X0 / X1 / Y0 / Y1 if your layout differs.
+    crop_x0: float = 0.38
+    crop_x1: float = 1.0
+    crop_y0: float = 0.05
+    crop_y1: float = 0.92
+    # overlay text refresh for noisy OCR (ms); prices/catalog still jump immediately when they change
+    ui_refresh_ms: int = 450
     # TCGPlayer official API (optional fallback)
     tcgplayer_public_key: str | None = None
     tcgplayer_private_key: str | None = None
@@ -58,6 +67,11 @@ class Settings:
             foil_ratio_threshold=float(
                 os.environ.get("WPC_FOIL_RATIO_THRESHOLD", cls.foil_ratio_threshold)
             ),
+            crop_x0=float(os.environ.get("WPC_CROP_X0", cls.crop_x0)),
+            crop_x1=float(os.environ.get("WPC_CROP_X1", cls.crop_x1)),
+            crop_y0=float(os.environ.get("WPC_CROP_Y0", cls.crop_y0)),
+            crop_y1=float(os.environ.get("WPC_CROP_Y1", cls.crop_y1)),
+            ui_refresh_ms=max(100, int(os.environ.get("WPC_UI_REFRESH_MS", cls.ui_refresh_ms))),
             tcgplayer_public_key=os.environ.get("TCGPLAYER_PUBLIC_KEY"),
             tcgplayer_private_key=os.environ.get("TCGPLAYER_PRIVATE_KEY"),
             tcgplayer_access_token=os.environ.get("TCGPLAYER_ACCESS_TOKEN"),
