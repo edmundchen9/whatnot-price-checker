@@ -1,16 +1,16 @@
 # Whatnot Price Checker
 
-A desktop overlay for Whatnot live streams that automatically detects Pokemon cards via OCR and displays real-time TCGPlayer pricing.
+A desktop overlay for Whatnot live streams that screenshots a selected card area on demand, detects the Pokemon card via OCR, and displays current TCGPlayer pricing.
 
 ## Features
 
 - **Region Picker** — draw a rectangle over the card area of any stream on any monitor
 - **Dual-region OCR** — scans the top of the card for the name and the bottom for the collector number, with aggressive upscaling for stream-quality footage
 - **Fuzzy name matching** — matches OCR output against a dictionary of 978 Pokemon names so typos like "Moltros" still resolve to "Moltres"
-- **TCGPlayer pricing** — pulls NM market price, low price, and set info via tcgapi.dev
+- **TCGPlayer pricing** — pulls current NM market, low, and mid prices from the official TCGPlayer API
 - **Foil / Normal toggle** — manually switch between foil and normal pricing
-- **Smart caching** — 24-hour in-memory cache to minimize API calls (tcgapi.dev has a 100/day limit)
-- **Network resilience** — automatic retry with backoff on transient failures; clear overlay messages when rate-limited
+- **On-demand scans** — press `S` when the card is visible instead of constantly refreshing the stream
+- **Clear API errors** — the overlay reports missing credentials or TCGPlayer request failures
 - **Draggable overlay** — frameless always-on-top window you can move anywhere
 
 ## Requirements
@@ -39,26 +39,26 @@ pip install easyocr
 Create a `.env` file in the project root:
 
 ```env
-TCGAPI_KEY=your_tcgapi_dev_key_here
+TCGPLAYER_PUBLIC_KEY=your_tcgplayer_public_key_here
+TCGPLAYER_PRIVATE_KEY=your_tcgplayer_private_key_here
+# or:
+# TCGPLAYER_ACCESS_TOKEN=your_existing_bearer_token
 ```
 
 ### All environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `TCGAPI_KEY` | — | API key for tcgapi.dev (required for pricing) |
-| `WPC_FPS` | `3.0` | Scan rate in frames per second |
-| `WPC_TCGAPI_PER_PAGE` | `25` | Results per API search query |
-| `WPC_PRICE_CACHE_TTL_SEC` | `86400` | How long to cache prices (seconds) |
+| `TCGPLAYER_ACCESS_TOKEN` | — | Bearer token for TCGPlayer API |
+| `TCGPLAYER_PUBLIC_KEY` | — | OAuth client ID for TCGPlayer API |
+| `TCGPLAYER_PRIVATE_KEY` | — | OAuth client secret for TCGPlayer API |
 | `WPC_UI_REFRESH_MS` | `450` | Overlay text refresh interval (ms) |
 
-Optional TCGPlayer official API (fallback if tcgapi.dev is not configured):
+Optional image recognition:
 
 | Variable | Description |
 |---|---|
-| `TCGPLAYER_ACCESS_TOKEN` | Bearer token for TCGPlayer API |
-| `TCGPLAYER_PUBLIC_KEY` | OAuth client ID |
-| `TCGPLAYER_PRIVATE_KEY` | OAuth client secret |
+| `GOOGLE_VISION_API_KEY` | Enables Google Vision Web Detection as an additional card identification signal |
 
 ## Usage
 
@@ -67,26 +67,27 @@ python -m whatnot_price_checker
 ```
 
 1. A fullscreen overlay appears — **draw a rectangle** over the area where the card is shown on the stream
-2. Click **Start Scanning**
-3. The overlay window appears showing detected card name, set, printing, and NM market price
-4. Use the **Normal/Foil** button to toggle between foil and normal pricing
-5. Use **Pick Region** to re-select the scan area
-6. Close with the **x** button
+2. Click **Use Region**
+3. When the card you want is visible, press **S** or click **Scan (S)**
+4. The overlay shows the detected card name, set, printing, and NM market price
+5. Use the **Normal/Foil** button to toggle between foil and normal pricing
+6. Use **Pick Region** to re-select the scan area
+7. Close with the **x** button
 
 ## How It Works
 
 ```
-Screen Capture → Resize to Card → Dual OCR → Fuzzy Match → API Lookup → Overlay
-     (mss)          (card.py)     (top 25%    (pokemon     (tcgapi.dev)  (PySide6)
+S key → Screen Capture → Resize to Card → Dual OCR → Fuzzy Match → API Lookup → Overlay
+        (mss)          (card.py)     (top 25%    (pokemon     (TCGPlayer)  (PySide6)
                                    + bottom    names.json)
                                    15%)
 ```
 
-1. `mss` captures the user-drawn screen region every frame
+1. `mss` captures the user-drawn screen region when you press `S`
 2. The frame is resized to standard card dimensions (420 x 587 px)
 3. Two separate OCR passes run on the top 25% (name) and bottom 15% (collector number)
 4. The OCR name is fuzzy-matched against a dictionary of all Pokemon names
-5. The matched name + collector number are sent to tcgapi.dev for pricing
+5. The matched name + collector number are sent to TCGPlayer for current pricing
 6. Results are displayed in the draggable overlay window
 
 ## Project Structure
@@ -103,7 +104,7 @@ src/whatnot_price_checker/
 ├── ocr_reader.py        # Dual-region OCR with fuzzy matching
 ├── pokemon_names.json   # Dictionary of 978 Pokemon names
 ├── region_picker.py     # Fullscreen region selection overlay
-├── tcgapi_client.py     # tcgapi.dev API client with retry logic
-├── tcgplayer.py         # Official TCGPlayer API client (fallback)
+├── tcgapi_client.py     # Legacy tcgapi.dev API client
+├── tcgplayer.py         # Official TCGPlayer API client
 └── win_window.py        # Windows window utilities (kept for reference)
 ```

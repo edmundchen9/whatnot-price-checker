@@ -32,9 +32,22 @@ def _row_get(row: dict, *keys: str):
 class PriceQuote:
     product_id: int
     name: str
+    set_name: str
+    number: str
+    rarity: str
     market_price: float | None
     low_price: float | None
-    sub_type_name: str | None
+    mid_price: float | None
+    printing: str
+
+
+@dataclass(frozen=True)
+class ProductInfo:
+    product_id: int
+    name: str
+    set_name: str
+    number: str
+    rarity: str
 
 
 class TcgClient:
@@ -112,23 +125,31 @@ class TcgClient:
                 continue
         return out
 
-    def product_names(self, product_ids: list[int]) -> dict[int, str]:
+    def product_details(self, product_ids: list[int]) -> dict[int, ProductInfo]:
         if not product_ids:
             return {}
         csv_ids = ",".join(str(i) for i in product_ids)
         r = self._http.get(
             f"{self._root}/catalog/products/{csv_ids}",
             headers={**self._auth_header(), "Accept": "application/json"},
-            params={"getExtendedFields": "false"},
+            params={"getExtendedFields": "true"},
         )
         r.raise_for_status()
         payload = r.json()
-        out: dict[int, str] = {}
+        out: dict[int, ProductInfo] = {}
         for row in _result_rows(payload):
             pid = _row_get(row, "productId", "ProductId")
             if pid is None:
                 continue
-            out[int(pid)] = str(_row_get(row, "name", "Name") or "")
+            extended = _extended_fields(row)
+            product_id = int(pid)
+            out[product_id] = ProductInfo(
+                product_id=product_id,
+                name=str(_row_get(row, "name", "Name") or ""),
+                set_name=str(_row_get(row, "groupName", "GroupName") or ""),
+                number=extended.get("number", ""),
+                rarity=extended.get("rarity", ""),
+            )
         return out
 
     def prices_for(self, product_ids: list[int]) -> dict[int, list[dict]]:
@@ -152,21 +173,33 @@ class TcgClient:
             by_id.setdefault(pid, []).append(row)
         return by_id
 
-    def quote_best_match(self, ocr_name: str) -> PriceQuote | None:
+    def quote_best_match(
+        self,
+        ocr_name: str,
+        *,
+        collector_number: str = "",
+        prefer_foil: bool = False,
+    ) -> PriceQuote | None:
         ids = self.search_pokemon_by_name(ocr_name)
         if not ids:
             return None
-        names = self.product_names(ids[:3])
-        prices = self.prices_for(ids[:3])
-        primary = ids[0]
+        candidates = ids[:5]
+        products = self.product_details(candidates)
+        prices = self.prices_for(candidates)
+        primary = _pick_product_id(candidates, products, collector_number)
+        info = products.get(primary)
         rows = prices.get(primary) or []
-        pick = _pick_normal_row(rows)
+        pick = _pick_price_row(rows, prefer_foil=prefer_foil)
         return PriceQuote(
             product_id=primary,
-            name=names.get(primary, ocr_name),
+            name=info.name if info and info.name else ocr_name,
+            set_name=info.set_name if info else "",
+            number=info.number if info else "",
+            rarity=info.rarity if info else "",
             market_price=_as_float(_row_get(pick, "marketPrice", "MarketPrice")),
             low_price=_as_float(_row_get(pick, "lowPrice", "LowPrice")),
-            sub_type_name=_row_get(pick, "subTypeName", "SubTypeName"),
+            mid_price=_as_float(_row_get(pick, "midPrice", "MidPrice")),
+            printing=str(_row_get(pick, "subTypeName", "SubTypeName") or ""),
         )
 
 
@@ -179,9 +212,54 @@ def _as_float(v: object) -> float | None:
         return None
 
 
-def _pick_normal_row(rows: list[dict]) -> dict:
+def _extended_fields(row: dict) -> dict[str, str]:
+    fields = _row_get(row, "extendedData", "ExtendedData") or []
+    out: dict[str, str] = {}
+    for item in fields:
+        if not isinstance(item, dict):
+            continue
+        name = str(_row_get(item, "name", "Name") or "").strip().lower()
+        value = str(_row_get(item, "value", "Value") or "").strip()
+        if name == "number":
+            out["number"] = value
+        elif name == "rarity":
+            out["rarity"] = value
+    return out
+
+
+def _normalize_number(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+def _collector_prefix(value: str) -> str:
+    prefix = value.split("/", 1)[0]
+    normalized = _normalize_number(prefix).lstrip("0")
+    return normalized or _normalize_number(prefix)
+
+
+def _pick_product_id(
+    product_ids: list[int],
+    products: dict[int, ProductInfo],
+    collector_number: str,
+) -> int:
+    wanted = _collector_prefix(collector_number)
+    if wanted:
+        for product_id in product_ids:
+            info = products.get(product_id)
+            if info and _collector_prefix(info.number) == wanted:
+                return product_id
+    return product_ids[0]
+
+
+def _pick_price_row(rows: list[dict], *, prefer_foil: bool) -> dict:
+    preferred = "holofoil" if prefer_foil else "normal"
     for row in rows:
         st = str(_row_get(row, "subTypeName", "SubTypeName") or "")
-        if st.lower() == "normal":
+        if st.lower() == preferred:
             return row
+    if prefer_foil:
+        for row in rows:
+            st = str(_row_get(row, "subTypeName", "SubTypeName") or "").lower()
+            if "foil" in st:
+                return row
     return rows[0] if rows else {}

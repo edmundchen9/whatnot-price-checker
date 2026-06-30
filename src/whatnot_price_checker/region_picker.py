@@ -49,7 +49,7 @@ class RegionPicker(QWidget):
             self._screenshot.width(), self._screenshot.height(),
         )
 
-        self._btn = QPushButton("Start Scanning", self)
+        self._btn = QPushButton("Use Region", self)
         self._btn.setFixedSize(180, 44)
         self._btn.hide()
         self._btn.clicked.connect(self._on_confirm)
@@ -79,13 +79,13 @@ class RegionPicker(QWidget):
         p.drawText(
             self.rect().adjusted(0, 50, 0, 0),
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-            "Draw a rectangle over the video area to scan",
+            "Draw a rectangle over the card screenshot area",
         )
         p.setFont(QFont("Segoe UI", 13))
         p.drawText(
             self.rect().adjusted(0, 95, 0, 0),
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-            "Click and drag \u2014 then press Start.   ESC to cancel.",
+            "Click and drag \u2014 then press Use Region. Press S in the overlay to scan.",
         )
         p.end()
 

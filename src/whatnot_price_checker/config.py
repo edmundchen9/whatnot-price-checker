@@ -26,9 +26,10 @@ def normalize_price_lookup_key(name: str) -> str:
 class Settings:
     """Runtime settings; override with env vars where noted."""
 
+    # Legacy live-scanner settings retained for older code paths.
     capture_fps: float = 8.0
 
-    # tcgapi.dev (preferred when set)
+    # Legacy tcgapi.dev settings.
     tcgapi_key: str | None = None
     tcgapi_per_page: int = 25
     price_cache_ttl_sec: float = 86400.0

@@ -6,10 +6,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import cv2
-
 from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from whatnot_price_checker.capture import Region, grab_region
@@ -119,6 +117,20 @@ def _pick_vision_search_name(vis_result: VisionResult, ocr_name: str) -> str:
     return ocr_name
 
 
+def _compact_tcgplayer_search_name(candidate: str, fallback: str) -> str:
+    """Keep Vision searches compatible with TCGPlayer's product-name filter."""
+    words = candidate.strip().split()
+    if not words:
+        return fallback
+    first = words[0].strip(":-/#").lower()
+    if first not in _POKEMON_NAMES:
+        return fallback
+    out = [words[0]]
+    if len(words) > 1 and words[1].strip(":-/#").lower() in {"ex", "gx", "v", "vmax", "vstar"}:
+        out.append(words[1])
+    return " ".join(out)
+
+
 class ScanWorker(QThread):
     snapshot = Signal(dict)
 
@@ -135,7 +147,6 @@ class ScanWorker(QThread):
         self._cache_until = 0.0
         self._cache_bundle: dict = {}
         self._api_http_calls = 0
-        self._last_frame_hash: int = 0
 
     def set_foil_preference(self, foil: bool) -> None:
         self._prefer_foil = foil
@@ -145,35 +156,24 @@ class ScanWorker(QThread):
         self.requestInterruption()
 
     def run(self) -> None:
-        tcgapi: TcgApiClient | None = None
-        if self._settings.tcgapi_key:
-            tcgapi = TcgApiClient(self._settings.tcgapi_key)
-
         tcgplayer: TcgClient | None = None
-        if tcgapi is None:
-            has_token = bool(self._settings.tcgplayer_access_token)
-            has_keys = bool(
-                self._settings.tcgplayer_public_key and self._settings.tcgplayer_private_key
-            )
-            if has_token or has_keys:
-                tcgplayer = TcgClient(self._settings)
+        has_token = bool(self._settings.tcgplayer_access_token)
+        has_keys = bool(
+            self._settings.tcgplayer_public_key and self._settings.tcgplayer_private_key
+        )
+        if has_token or has_keys:
+            tcgplayer = TcgClient(self._settings)
 
         vision: VisionClient | None = None
         if self._settings.google_vision_key:
             vision = VisionClient(self._settings.google_vision_key)
 
-        interval_ms = max(50, int(1000.0 / max(0.5, self._settings.capture_fps)))
-
         try:
-            while not self._stop and not self.isInterruptionRequested():
-                try:
-                    self._tick(tcgapi, tcgplayer, vision)
-                except Exception as e:
-                    self._emit_snapshot({"status": "error", "detail": str(e)})
-                self._sleep_cancellable(interval_ms)
+            try:
+                self._tick(None, tcgplayer, vision)
+            except Exception as e:
+                self._emit_snapshot({"status": "error", "detail": str(e)})
         finally:
-            if tcgapi is not None:
-                tcgapi.close()
             if tcgplayer is not None:
                 tcgplayer.close()
             if vision is not None:
@@ -198,19 +198,11 @@ class ScanWorker(QThread):
         warped, warp_source = warp_for_ocr(frame)
         if warped is None:
             self._reset_stable()
-            self._last_frame_hash = 0
-            self._emit_snapshot({"status": "scanning"})
+            self._emit_snapshot({"status": "idle", "detail": "No card-shaped region found in screenshot. Press S to try again."})
             return
 
-        # Frame-diff gate: skip processing entirely on duplicate frames.
-        frame_hash = hash(cv2.resize(warped, (16, 16)).tobytes())
-        if frame_hash == self._last_frame_hash:
-            return
-        self._last_frame_hash = frame_hash
-
-        stabilized = (self._stable_ticks or 0) >= 1
         try:
-            ocr = read_card(warped, name_only=not stabilized)
+            ocr = read_card(warped, name_only=False)
         except RuntimeError as e:
             self._emit_snapshot({"status": "ocr_missing", "detail": str(e)})
             return
@@ -251,14 +243,9 @@ class ScanWorker(QThread):
         }
 
         if not name:
-            self._empty_ticks += 1
-            # Only tear down state after several consecutive empty frames so that
-            # one blurry/transient frame does not wipe the overlay.
-            if self._empty_ticks >= self._settings.empty_ticks_before_reset:
-                self._reset_stable()
-                base["lookup_stage"] = "No card name detected by OCR."
-                print("[SCAN] No name detected, skipping API lookup.")
-                self._emit_snapshot(base)
+            base["lookup_stage"] = "No card name detected in screenshot."
+            print("[SCAN] No name detected, skipping API lookup.")
+            self._emit_snapshot(base)
             return
 
         self._empty_ticks = 0
@@ -269,56 +256,46 @@ class ScanWorker(QThread):
         else:
             self._stable_ticks += 1
 
-        if tcgapi is None and tcgplayer is None:
-            base["detail"] = "Set TCGAPI_KEY (tcgapi.dev) or TCGPlayer API env vars for prices."
+        if tcgplayer is None:
+            base["detail"] = (
+                "Set TCGPLAYER_ACCESS_TOKEN or TCGPLAYER_PUBLIC_KEY/TCGPLAYER_PRIVATE_KEY for prices."
+            )
             base["lookup_stage"] = "No price API key configured."
             self._emit_snapshot(base)
             return
 
-        # Vision-first path: on the very first tick of a new card, if Vision is configured,
-        # run Vision + OCR in parallel immediately — no stabilization wait required.
-        if vision is not None and is_new_card and tcgapi is not None:
-            lk = f"{normalize_price_lookup_key(name)}|{collector}|{int(foil)}"
-            now = time.time()
-            if lk == self._cache_key and now < self._cache_until:
-                base["lookup_stage"] = "Cached"
-                self._emit_snapshot({**base, **self._cache_bundle})
-                return
-            self._vision_first_tick(tcgapi, vision, base, lk, now, warped)
-            return
+        search_name = name
+        if vision is not None:
+            vision_result = self._fetch_vision(vision, base, warped)
+            search_name = _compact_tcgplayer_search_name(
+                _pick_vision_search_name(vision_result, name),
+                name,
+            )
+            if search_name != name:
+                base["lookup_stage"] = f"Vision search: {search_name!r}"
 
-        # Standard OCR stabilization path (no Vision key, or tcgplayer fallback).
-        need = self._settings.stable_ticks_required
-        if self._stable_ticks < need:
-            base["lookup_stage"] = f"Stabilizing: name {self._stable_ticks}/{need}"
-            self._emit_snapshot(base)
-            return
-
-        lk = f"{normalize_price_lookup_key(name)}|{collector}|{int(foil)}"
+        lk = f"{normalize_price_lookup_key(search_name)}|{collector}|{int(foil)}"
         now = time.time()
         if lk == self._cache_key and now < self._cache_until:
             base["lookup_stage"] = "Cached"
             self._emit_snapshot({**base, **self._cache_bundle})
             return
 
-        first_lookup = self._stable_ticks == need
-
-        if tcgapi is not None:
-            self._fetch_tcgapi(tcgapi, base, lk, now)
-        elif tcgplayer is not None:
-            if vision is not None and first_lookup:
-                self._fetch_vision(vision, base, warped)
-            self._fetch_tcgplayer(tcgplayer, base, lk, now)
+        self._fetch_tcgplayer(tcgplayer, base, lk, now, search_name=search_name)
 
     def _emit_snapshot(self, payload: dict) -> None:
         out = dict(payload)
         out["api_http_calls"] = self._api_http_calls
         out["has_tcgapi_key"] = bool(self._settings.tcgapi_key)
+        out["has_tcgplayer_key"] = bool(
+            self._settings.tcgplayer_access_token
+            or (self._settings.tcgplayer_public_key and self._settings.tcgplayer_private_key)
+        )
         self.snapshot.emit(out)
 
     def _fetch_vision(
         self, client: VisionClient, base: dict, frame
-    ) -> None:
+    ) -> VisionResult:
         """Call Vision API and write results into base in-place."""
         print("[VISION] Sending frame to Cloud Vision Web Detection…")
         result = client.analyze(frame)
@@ -326,6 +303,7 @@ class ScanWorker(QThread):
             base["vision_label"] = result.best_label
         if result.tcgplayer_url:
             base["vision_tcgplayer_url"] = result.tcgplayer_url
+        return result
 
     def _parallel_vision_and_tcgapi(
         self,
@@ -542,12 +520,26 @@ class ScanWorker(QThread):
             )
         self._store_cache(lk, now, base, bundle)
 
-    def _fetch_tcgplayer(self, client: TcgClient, base: dict, lk: str, now: float) -> None:
+    def _fetch_tcgplayer(
+        self,
+        client: TcgClient,
+        base: dict,
+        lk: str,
+        now: float,
+        *,
+        search_name: str | None = None,
+    ) -> None:
         self._api_http_calls += 1
-        base["lookup_stage"] = f"TCGPlayer API request (session #{self._api_http_calls})…"
+        name = (search_name or base["ocr_name"]).strip() or base["ocr_name"]
+        collector = (base.get("collector_number") or "").strip()
+        base["lookup_stage"] = f"TCGPlayer search: {name!r} (shot #{self._api_http_calls})…"
         self._emit_snapshot(dict(base))
         try:
-            quote = client.quote_best_match(base["ocr_name"])
+            quote = client.quote_best_match(
+                name,
+                collector_number=collector,
+                prefer_foil=self._prefer_foil,
+            )
         except Exception as e:
             base["detail"] = str(e)
             base["lookup_stage"] = "TCGPlayer request failed."
@@ -562,16 +554,16 @@ class ScanWorker(QThread):
 
         bundle = {
             "tcg_name": quote.name,
-            "set_name": "",
-            "printing": "Normal",
-            "rarity": "",
-            "card_number": "",
+            "set_name": quote.set_name,
+            "printing": quote.printing or ("Holofoil" if self._prefer_foil else "Normal"),
+            "rarity": quote.rarity,
+            "card_number": quote.number,
             "product_type": "",
             "catalog_foil_only": "",
             "listings": "",
             "market": f"{quote.market_price:.2f}" if quote.market_price is not None else "—",
             "low": f"{quote.low_price:.2f}" if quote.low_price is not None else "—",
-            "median": "",
+            "median": f"{quote.mid_price:.2f}" if quote.mid_price is not None else "—",
             "rate_remaining": "",
             "rate_reset": "",
             "detail": "",
@@ -653,9 +645,7 @@ class OverlayWindow(QWidget):
         self._dragging = False
         self._drag_offset = QPoint()
 
-        if settings.tcgapi_key:
-            subtitle = "Whatnot · tcgapi.dev"
-        elif (
+        if (
             settings.tcgplayer_access_token
             or (
                 settings.tcgplayer_public_key and settings.tcgplayer_private_key
@@ -666,6 +656,7 @@ class OverlayWindow(QWidget):
             subtitle = "Whatnot · price checker"
 
         self.setWindowTitle("Whatnot price checker")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -704,6 +695,14 @@ class OverlayWindow(QWidget):
             "padding: 0 8px; font-size: 11px;"
         )
 
+        self._scan_btn = QPushButton("Scan (S)")
+        self._scan_btn.setFixedHeight(28)
+        self._scan_btn.clicked.connect(self.trigger_scan)
+        self._scan_btn.setStyleSheet(
+            "background: #2d4f7a; color: #eee; border: none; border-radius: 4px; "
+            "padding: 0 8px; font-size: 11px;"
+        )
+
         pick_btn = QPushButton("Pick Region")
         pick_btn.setFixedHeight(28)
         pick_btn.clicked.connect(self._on_repick)
@@ -723,6 +722,7 @@ class OverlayWindow(QWidget):
         header.addWidget(title)
         header.addStretch(1)
         header.addWidget(self._foil_btn)
+        header.addWidget(self._scan_btn)
         header.addWidget(pick_btn)
         header.addWidget(close_btn)
 
@@ -751,8 +751,11 @@ class OverlayWindow(QWidget):
         self._ui_timer.setInterval(max(100, settings.ui_refresh_ms))
         self._ui_timer.timeout.connect(self._render_live_tick)
 
-        self._worker = ScanWorker(settings, self._scan_region, prefer_foil=self._prefer_foil, parent=self)
-        self._worker.snapshot.connect(self._on_snapshot)
+        self._scan_shortcut = QShortcut(QKeySequence("S"), self)
+        self._scan_shortcut.activated.connect(self.trigger_scan)
+
+        self._worker: ScanWorker | None = None
+        self._render_body({"status": "idle", "detail": "Press S to screenshot and scan the selected region."})
 
     def _toggle_foil(self) -> None:
         self._prefer_foil = not self._prefer_foil
@@ -763,42 +766,65 @@ class OverlayWindow(QWidget):
             "color: #ccc; border: none; border-radius: 4px; "
             "padding: 0 8px; font-size: 11px;"
         )
-        self._worker.set_foil_preference(self._prefer_foil)
-        self._worker._cache_key = None
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.set_foil_preference(self._prefer_foil)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
         if not self._ui_timer.isActive():
             self._ui_timer.start()
-        if not self._worker.isRunning():
-            self._worker.start()
+        self.activateWindow()
+        self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
     def closeEvent(self, event) -> None:
         self._ui_timer.stop()
-        self._worker.stop()
-        if not self._worker.wait(3000):
-            self._worker.terminate()
-            self._worker.wait(1000)
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.stop()
+            if not self._worker.wait(3000):
+                self._worker.terminate()
+                self._worker.wait(1000)
         super().closeEvent(event)
         app = QApplication.instance()
         if app is not None:
             app.quit()
 
     def update_region(self, region: Region) -> None:
-        """Apply a new scan region and restart the scanner."""
+        """Apply a new scan region and wait for the next explicit screenshot scan."""
         self._scan_region = region
-        if self._worker.isRunning():
+        if self._worker is not None and self._worker.isRunning():
             self._worker.stop()
             self._worker.wait(2000)
         self._sticky_tcgplayer_url = ""
         self._sticky_tcgplayer_label = ""
+        self._worker = None
+        self._last_digest_key = None
+        self._latest_payload = {"status": "idle", "detail": "Region updated. Press S to screenshot and scan."}
+        self._render_body(self._latest_payload)
+
+    def trigger_scan(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._body.setText("Scan already running…")
+            return
+        self._scan_btn.setEnabled(False)
+        self._latest_payload = {"status": "capturing", "detail": "Capturing screenshot and reading card…"}
+        self._render_body(self._latest_payload)
         self._worker = ScanWorker(self._settings, self._scan_region, prefer_foil=self._prefer_foil, parent=self)
         self._worker.snapshot.connect(self._on_snapshot)
+        self._worker.finished.connect(self._on_scan_finished)
         self._worker.start()
-        self._body.setText("Region updated — scanning…")
+
+    def _on_scan_finished(self) -> None:
+        self._scan_btn.setEnabled(True)
 
     def _on_repick(self) -> None:
         self.request_repick.emit()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_S:
+            self.trigger_scan()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -832,8 +858,8 @@ class OverlayWindow(QWidget):
         self._latest_payload = data
         status = data.get("status", "")
         if status != "card":
-            # Only clear sticky link when the overlay is explicitly wiped (not a transient empty).
-            if status == "scanning":
+            # Clear sticky links when the overlay returns to its explicit idle state.
+            if status == "idle":
                 self._sticky_tcgplayer_url = ""
                 self._sticky_tcgplayer_label = ""
             self._last_digest_key = None
@@ -872,8 +898,13 @@ class OverlayWindow(QWidget):
         status = data.get("status", "")
         if not status:
             return
-        if status == "scanning":
-            self._body.setText("Scanning for card…")
+        if status == "idle":
+            detail = data.get("detail") or "Press S to screenshot and scan the selected region."
+            self._body.setText(str(detail))
+            self._link_label.hide()
+            return
+        if status == "capturing":
+            self._body.setText(data.get("detail", "Capturing screenshot…"))
             self._link_label.hide()
             return
         if status == "ocr_missing":
