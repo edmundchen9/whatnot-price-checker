@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote_plus
-
 import httpx
 
 
 BASE_URL = "https://api.tcgapi.dev/v1"
+
+MAX_RETRIES = 2
+RETRY_BACKOFF = [1.0, 3.0]
+
+
+class NetworkError(Exception):
+    """Transient network/HTTP failure after retries."""
+
+
+class RateLimitError(Exception):
+    """Daily API quota exhausted."""
 
 
 @dataclass(frozen=True)
@@ -49,12 +59,27 @@ class TcgApiClient:
             "type": "Cards",
             "per_page": str(min(max(per_page, 1), 100)),
         }
-        r = self._http.get(f"{BASE_URL}/search", params=params)
-        r.raise_for_status()
-        payload = r.json()
-        rows = list(payload.get("data") or [])
-        meta = payload.get("rate_limit") or {}
-        return rows, meta
+
+        last_exc: Exception | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                r = self._http.get(f"{BASE_URL}/search", params=params)
+                if r.status_code == 429:
+                    raise RateLimitError(
+                        "Daily API limit reached. Prices are cached; results will resume tomorrow.",
+                    )
+                r.raise_for_status()
+                payload = r.json()
+                rows = list(payload.get("data") or [])
+                meta = payload.get("rate_limit") or {}
+                return rows, meta
+            except RateLimitError:
+                raise
+            except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout) as exc:
+                last_exc = exc
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_BACKOFF[attempt])
+        raise NetworkError(f"API request failed after {MAX_RETRIES + 1} attempts: {last_exc}") from last_exc
 
     def quote_from_search(
         self,
@@ -123,6 +148,3 @@ def _safe_int(v: object) -> int:
         return 0
 
 
-def tcgplayer_deep_link(name: str) -> str:
-    """Manual price check when no API key (opens TCGPlayer search)."""
-    return f"https://www.tcgplayer.com/search/pokemon/product?q={quote_plus(name)}&view=grid"

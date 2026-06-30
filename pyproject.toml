@@ -27,3 +27,6 @@ whatnot-price-checker = "whatnot_price_checker.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+whatnot_price_checker = ["*.json"]

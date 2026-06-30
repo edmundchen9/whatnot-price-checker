@@ -26,25 +26,31 @@ def normalize_price_lookup_key(name: str) -> str:
 class Settings:
     """Runtime settings; override with env vars where noted."""
 
-    # substring match against window title (Windows)
-    window_title_contains: str = "Whatnot"
-    capture_fps: float = 3.0
-    min_card_area_ratio: float = 0.02
-    max_card_area_ratio: float = 0.95
+    capture_fps: float = 8.0
+
     # tcgapi.dev (preferred when set)
     tcgapi_key: str | None = None
     tcgapi_per_page: int = 25
     price_cache_ttl_sec: float = 86400.0
-    foil_ratio_threshold: float = 1.65
-    # Video region crop — fraction of the captured browser window.
-    # Whatnot puts the video player on the right; chat/sidebar is on the left.
-    # Tweak with WPC_CROP_X0 / X1 / Y0 / Y1 if your layout differs.
-    crop_x0: float = 0.38
-    crop_x1: float = 1.0
-    crop_y0: float = 0.05
-    crop_y1: float = 0.92
-    # overlay text refresh for noisy OCR (ms); prices/catalog still jump immediately when they change
+
+    # overlay text refresh (ms)
     ui_refresh_ms: int = 450
+
+    # Consecutive frames with the same OCR name before price lookup when Vision is absent.
+    # With Vision enabled this is bypassed — Vision fires on frame 1 directly.
+    stable_ticks_required: int = 1
+
+    # How many consecutive empty/no-name frames must occur before the overlay is cleared.
+    # Prevents a single blurry frame from wiping a good result off the screen.
+    empty_ticks_before_reset: int = 4
+
+    # Google Cloud Vision Web Detection (optional — for image-based card ID)
+    google_vision_key: str | None = None
+
+    # If True, tcgapi search uses Vision bestGuess when available (waits for Vision before search).
+    # If False, Vision runs in parallel with tcgapi (OCR name); Vision is overlay-only for speed.
+    vision_primary_for_search: bool = False
+
     # TCGPlayer official API (optional fallback)
     tcgplayer_public_key: str | None = None
     tcgplayer_private_key: str | None = None
@@ -55,23 +61,18 @@ class Settings:
     def from_env(cls) -> Settings:
         _load_dotenv_files()
         return cls(
-            window_title_contains=os.environ.get(
-                "WPC_WINDOW_TITLE", cls.window_title_contains
-            ),
             capture_fps=float(os.environ.get("WPC_FPS", cls.capture_fps)),
             tcgapi_key=os.environ.get("TCGAPI_KEY") or os.environ.get("WPC_TCGAPI_KEY"),
             tcgapi_per_page=int(os.environ.get("WPC_TCGAPI_PER_PAGE", "25")),
             price_cache_ttl_sec=float(
                 os.environ.get("WPC_PRICE_CACHE_TTL_SEC", cls.price_cache_ttl_sec)
             ),
-            foil_ratio_threshold=float(
-                os.environ.get("WPC_FOIL_RATIO_THRESHOLD", cls.foil_ratio_threshold)
-            ),
-            crop_x0=float(os.environ.get("WPC_CROP_X0", cls.crop_x0)),
-            crop_x1=float(os.environ.get("WPC_CROP_X1", cls.crop_x1)),
-            crop_y0=float(os.environ.get("WPC_CROP_Y0", cls.crop_y0)),
-            crop_y1=float(os.environ.get("WPC_CROP_Y1", cls.crop_y1)),
             ui_refresh_ms=max(100, int(os.environ.get("WPC_UI_REFRESH_MS", cls.ui_refresh_ms))),
+            stable_ticks_required=max(1, int(os.environ.get("WPC_STABLE_TICKS", cls.stable_ticks_required))),
+            empty_ticks_before_reset=max(1, int(os.environ.get("WPC_EMPTY_TICKS_RESET", cls.empty_ticks_before_reset))),
+            google_vision_key=os.environ.get("GOOGLE_VISION_API_KEY"),
+            vision_primary_for_search=os.environ.get("WPC_VISION_PRIMARY_SEARCH", "").lower()
+            in ("1", "true", "yes"),
             tcgplayer_public_key=os.environ.get("TCGPLAYER_PUBLIC_KEY"),
             tcgplayer_private_key=os.environ.get("TCGPLAYER_PRIVATE_KEY"),
             tcgplayer_access_token=os.environ.get("TCGPLAYER_ACCESS_TOKEN"),

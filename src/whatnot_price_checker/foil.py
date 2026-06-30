@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cv2
+import numpy as np
 
 
 def foil_art_texture_ratio(warped_bgr: np.ndarray) -> float:

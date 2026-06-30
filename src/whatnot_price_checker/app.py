@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import cv2
 
 from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFont
@@ -10,28 +15,130 @@ from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QV
 from whatnot_price_checker.capture import Region, grab_region
 from whatnot_price_checker.card import warp_for_ocr
 from whatnot_price_checker.config import Settings, normalize_price_lookup_key
-from whatnot_price_checker.foil import foil_art_texture_ratio, foil_likely
 from whatnot_price_checker.ocr_reader import read_card
-from whatnot_price_checker.tcgapi_client import TcgApiClient
+from whatnot_price_checker.tcgapi_client import NetworkError, RateLimitError, TcgApiClient
 from whatnot_price_checker.tcgplayer import TcgClient
+from whatnot_price_checker.vision_client import VisionClient, VisionResult
+
+# ---------------------------------------------------------------------------
+# Vision label quality helpers
+# ---------------------------------------------------------------------------
+
+def _load_pokemon_name_set() -> frozenset[str]:
+    """Lowercase set of all known Pokémon species names for entity matching."""
+    p = Path(__file__).with_name("pokemon_names.json")
+    try:
+        names: list[str] = json.loads(p.read_text(encoding="utf-8"))
+        return frozenset(n.strip().lower() for n in names if n.strip())
+    except Exception:
+        return frozenset()
+
+
+_POKEMON_NAMES: frozenset[str] = _load_pokemon_name_set()
+
+# Generic best-guess labels that describe the capture environment, not the card.
+_VISION_LABEL_BLOCKLIST: frozenset[str] = frozenset({
+    "screenshot", "screen shot", "smartphone", "smart phone",
+    "mobile phone", "cellphone", "cell phone", "phone", "iphone",
+    "android", "tablet", "tablet computer", "laptop", "computer",
+    "poster", "flyer", "banner", "sign", "signage",
+    "cartoon", "animation", "animated cartoon", "anime",
+    "action figure", "figurine", "toy", "doll",
+    "electronics", "electronic device", "consumer electronics",
+    "technology", "gadget", "camera", "digital camera", "webcam",
+    "darkness", "light", "font", "text", "paper", "rectangle",
+    "product", "publication", "book", "display device", "monitor",
+    "television", "multimedia", "material property", "graphic",
+    "graphic design", "illustration", "art", "artwork",
+})
+
+# Noise suffixes appended by Web Detection that confuse tcgapi searches.
+_LABEL_STRIP_SUFFIXES: tuple[str, ...] = (
+    " pokemon tcg card", " pokemon tcg", " pokemon card",
+    " trading card game", " trading card", " card game",
+    " tcg card", " tcg", " pokemon", " ex card", " gx card",
+)
+
+# Words that mark a web entity as generic / hardware / non-card.
+_ENTITY_BLOCKLIST_WORDS: frozenset[str] = frozenset({
+    "smartphone", "mobile", "phone", "blackberry", "samsung",
+    "apple", "iphone", "android", "nokia", "motorola",
+    "electronics", "technology", "television", "computer",
+    "camera", "screen", "display", "monitor", "tablet",
+    "trading card", "card game", "pocket", "tcg",
+    "figure", "figurine", "toy", "action",
+})
+
+
+def _pick_vision_search_name(vis_result: VisionResult, ocr_name: str) -> str:
+    """Return the best tcgapi search term derived from Vision + OCR.
+
+    Priority:
+      1. Entity that is a known Pokémon name (highest confidence signal).
+      2. Vision best-guess label after stripping noise suffixes, if not blocked.
+      3. Any short web entity that doesn't look like generic hardware/tech.
+      4. OCR-derived name as final fallback.
+    """
+    # --- Pass 1: look for a known Pokémon species in the entity list first.
+    # Web entities are sorted by confidence by Google, so first match wins.
+    for entity in vis_result.entities:
+        e = entity.strip()
+        if not e:
+            continue
+        # Single Pokémon name or "Name ex / Name V / Name GX" etc.
+        first_word = e.split()[0].lower()
+        if first_word in _POKEMON_NAMES:
+            return e  # e.g. "Dustox" or "Charizard ex"
+
+    # --- Pass 2: cleaned best-guess label.
+    raw_label = (vis_result.best_label or "").strip().lower()
+    cleaned = raw_label
+    for suffix in _LABEL_STRIP_SUFFIXES:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip()
+            break
+
+    if cleaned and cleaned not in _VISION_LABEL_BLOCKLIST:
+        # Extra check: if the first word of the cleaned label is a known Pokémon
+        # name, use the cleaned label as-is (e.g. "dustox" after stripping " tcg").
+        return cleaned
+
+    # --- Pass 3: any short, non-generic entity.
+    for entity in vis_result.entities:
+        e = entity.strip()
+        if not e:
+            continue
+        words = e.lower().split()
+        if len(words) > 3:
+            continue
+        if any(w in _ENTITY_BLOCKLIST_WORDS for w in words):
+            continue
+        return e
+
+    # --- Pass 4: OCR.
+    return ocr_name
 
 
 class ScanWorker(QThread):
     snapshot = Signal(dict)
 
-    def __init__(self, settings: Settings, scan_region: Region, parent: QWidget | None = None) -> None:
+    def __init__(self, settings: Settings, scan_region: Region, *, prefer_foil: bool = False, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._settings = settings
         self._scan_region = scan_region
+        self._prefer_foil = prefer_foil
         self._stop = False
         self._stable_name: str | None = None
         self._stable_ticks = 0
-        self._foil_last = False
-        self._foil_agree_ticks = 0
+        self._empty_ticks = 0          # consecutive frames with no detected name
         self._cache_key: str | None = None
         self._cache_until = 0.0
         self._cache_bundle: dict = {}
         self._api_http_calls = 0
+        self._last_frame_hash: int = 0
+
+    def set_foil_preference(self, foil: bool) -> None:
+        self._prefer_foil = foil
 
     def stop(self) -> None:
         self._stop = True
@@ -51,12 +158,16 @@ class ScanWorker(QThread):
             if has_token or has_keys:
                 tcgplayer = TcgClient(self._settings)
 
+        vision: VisionClient | None = None
+        if self._settings.google_vision_key:
+            vision = VisionClient(self._settings.google_vision_key)
+
         interval_ms = max(50, int(1000.0 / max(0.5, self._settings.capture_fps)))
 
         try:
             while not self._stop and not self.isInterruptionRequested():
                 try:
-                    self._tick(tcgapi, tcgplayer)
+                    self._tick(tcgapi, tcgplayer, vision)
                 except Exception as e:
                     self._emit_snapshot({"status": "error", "detail": str(e)})
                 self._sleep_cancellable(interval_ms)
@@ -65,6 +176,8 @@ class ScanWorker(QThread):
                 tcgapi.close()
             if tcgplayer is not None:
                 tcgplayer.close()
+            if vision is not None:
+                vision.close()
 
     def _sleep_cancellable(self, total_ms: int) -> None:
         remaining = total_ms
@@ -73,33 +186,42 @@ class ScanWorker(QThread):
             self.msleep(chunk)
             remaining -= chunk
 
-    def _tick(self, tcgapi: TcgApiClient | None, tcgplayer: TcgClient | None) -> None:
+    def _tick(
+        self,
+        tcgapi: TcgApiClient | None,
+        tcgplayer: TcgClient | None,
+        vision: VisionClient | None = None,
+    ) -> None:
         if self._stop or self.isInterruptionRequested():
             return
         frame = grab_region(self._scan_region)
         warped, warp_source = warp_for_ocr(frame)
         if warped is None:
             self._reset_stable()
+            self._last_frame_hash = 0
             self._emit_snapshot({"status": "scanning"})
             return
 
+        # Frame-diff gate: skip processing entirely on duplicate frames.
+        frame_hash = hash(cv2.resize(warped, (16, 16)).tobytes())
+        if frame_hash == self._last_frame_hash:
+            return
+        self._last_frame_hash = frame_hash
+
+        stabilized = (self._stable_ticks or 0) >= 1
         try:
-            ocr = read_card(warped)
+            ocr = read_card(warped, name_only=not stabilized)
         except RuntimeError as e:
             self._emit_snapshot({"status": "ocr_missing", "detail": str(e)})
             return
 
         name = ocr.guessed_name.strip()
         collector = ocr.collector_number.strip()
-
-        ratio = foil_art_texture_ratio(warped)
-        foil_now = foil_likely(
-            warped, ratio_threshold=self._settings.foil_ratio_threshold
-        )
+        foil = self._prefer_foil
 
         lines_preview = " | ".join(ocr.raw_lines[:6])
         print(f"[OCR] warp={warp_source}  name={name!r}  collector={collector!r}  "
-              f"foil={'Y' if foil_now else 'N'}  raw={lines_preview}")
+              f"foil={'Y' if foil else 'N'}  raw={lines_preview}")
 
         base: dict = {
             "status": "card",
@@ -108,8 +230,7 @@ class ScanWorker(QThread):
             "collector_number": collector,
             "script": ocr.script,
             "ocr_lines": lines_preview,
-            "foil_ratio": round(ratio, 2),
-            "foil_guess": "foil" if foil_now else "non-foil",
+            "foil_guess": "Foil" if foil else "Normal",
             "tcg_name": "",
             "set_name": "",
             "printing": "",
@@ -125,27 +246,28 @@ class ScanWorker(QThread):
             "rate_reset": "",
             "detail": "",
             "lookup_stage": "",
+            "vision_label": "",
+            "vision_tcgplayer_url": "",
         }
 
         if not name:
-            self._reset_stable()
-            base["lookup_stage"] = "No card name detected by OCR."
-            print("[SCAN] No name detected, skipping API lookup.")
-            self._emit_snapshot(base)
+            self._empty_ticks += 1
+            # Only tear down state after several consecutive empty frames so that
+            # one blurry/transient frame does not wipe the overlay.
+            if self._empty_ticks >= self._settings.empty_ticks_before_reset:
+                self._reset_stable()
+                base["lookup_stage"] = "No card name detected by OCR."
+                print("[SCAN] No name detected, skipping API lookup.")
+                self._emit_snapshot(base)
             return
 
-        if name != self._stable_name:
+        self._empty_ticks = 0
+        is_new_card = name != self._stable_name
+        if is_new_card:
             self._stable_name = name
             self._stable_ticks = 1
-            self._foil_last = foil_now
-            self._foil_agree_ticks = 1
         else:
             self._stable_ticks += 1
-            if foil_now == self._foil_last:
-                self._foil_agree_ticks += 1
-            else:
-                self._foil_last = foil_now
-                self._foil_agree_ticks = 1
 
         if tcgapi is None and tcgplayer is None:
             base["detail"] = "Set TCGAPI_KEY (tcgapi.dev) or TCGPlayer API env vars for prices."
@@ -153,23 +275,39 @@ class ScanWorker(QThread):
             self._emit_snapshot(base)
             return
 
-        if self._stable_ticks < 2 or self._foil_agree_ticks < 2:
-            base["lookup_stage"] = (
-                f"Stabilizing: name {self._stable_ticks}/2, foil {self._foil_agree_ticks}/2"
-            )
+        # Vision-first path: on the very first tick of a new card, if Vision is configured,
+        # run Vision + OCR in parallel immediately — no stabilization wait required.
+        if vision is not None and is_new_card and tcgapi is not None:
+            lk = f"{normalize_price_lookup_key(name)}|{collector}|{int(foil)}"
+            now = time.time()
+            if lk == self._cache_key and now < self._cache_until:
+                base["lookup_stage"] = "Cached"
+                self._emit_snapshot({**base, **self._cache_bundle})
+                return
+            self._vision_first_tick(tcgapi, vision, base, lk, now, warped)
+            return
+
+        # Standard OCR stabilization path (no Vision key, or tcgplayer fallback).
+        need = self._settings.stable_ticks_required
+        if self._stable_ticks < need:
+            base["lookup_stage"] = f"Stabilizing: name {self._stable_ticks}/{need}"
             self._emit_snapshot(base)
             return
 
-        lk = f"{normalize_price_lookup_key(name)}|{int(self._foil_last)}"
+        lk = f"{normalize_price_lookup_key(name)}|{collector}|{int(foil)}"
         now = time.time()
         if lk == self._cache_key and now < self._cache_until:
             base["lookup_stage"] = "Cached"
             self._emit_snapshot({**base, **self._cache_bundle})
             return
 
+        first_lookup = self._stable_ticks == need
+
         if tcgapi is not None:
             self._fetch_tcgapi(tcgapi, base, lk, now)
         elif tcgplayer is not None:
+            if vision is not None and first_lookup:
+                self._fetch_vision(vision, base, warped)
             self._fetch_tcgplayer(tcgplayer, base, lk, now)
 
     def _emit_snapshot(self, payload: dict) -> None:
@@ -178,28 +316,187 @@ class ScanWorker(QThread):
         out["has_tcgapi_key"] = bool(self._settings.tcgapi_key)
         self.snapshot.emit(out)
 
+    def _fetch_vision(
+        self, client: VisionClient, base: dict, frame
+    ) -> None:
+        """Call Vision API and write results into base in-place."""
+        print("[VISION] Sending frame to Cloud Vision Web Detection…")
+        result = client.analyze(frame)
+        if result.best_label:
+            base["vision_label"] = result.best_label
+        if result.tcgplayer_url:
+            base["vision_tcgplayer_url"] = result.tcgplayer_url
+
+    def _parallel_vision_and_tcgapi(
+        self,
+        tcgapi: TcgApiClient,
+        vision: VisionClient,
+        base: dict,
+        lk: str,
+        now: float,
+        warped,
+    ) -> None:
+        """Run Google Vision Web Detection and tcgapi.dev search concurrently (lower latency)."""
+        base["lookup_stage"] = "Vision + tcgapi (parallel)…"
+        self._emit_snapshot(dict(base))
+
+        def vision_task():
+            print("[VISION] parallel Web Detection…")
+            return vision.analyze(warped)
+
+        def tcgapi_task():
+            ocr_name = base["ocr_name"]
+            collector = base.get("collector_number", "")
+            search_q = f"{ocr_name} {collector}".strip() if collector else ocr_name
+            calls = 0
+            try:
+                calls += 1
+                quote, meta = tcgapi.quote_from_search(
+                    search_q,
+                    prefer_foil=self._prefer_foil,
+                    per_page=self._settings.tcgapi_per_page,
+                )
+                if quote is None and collector:
+                    calls += 1
+                    quote, meta = tcgapi.quote_from_search(
+                        ocr_name,
+                        prefer_foil=self._prefer_foil,
+                        per_page=self._settings.tcgapi_per_page,
+                    )
+                return ("ok", quote, meta, calls, search_q, ocr_name, None)
+            except RateLimitError as e:
+                return ("rate", None, None, calls, search_q, ocr_name, e)
+            except NetworkError as e:
+                return ("net", None, None, calls, search_q, ocr_name, e)
+            except Exception as e:
+                return ("err", None, None, calls, search_q, ocr_name, e)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_v = pool.submit(vision_task)
+            fut_t = pool.submit(tcgapi_task)
+            vres = fut_v.result()
+            tapi = fut_t.result()
+
+        self._api_http_calls += tapi[3]
+
+        if vres.best_label:
+            base["vision_label"] = vres.best_label
+        if vres.tcgplayer_url:
+            base["vision_tcgplayer_url"] = vres.tcgplayer_url
+
+        kind, quote, _meta, _calls, search_q, _ocr_name, err = tapi
+        if kind == "rate":
+            base["detail"] = str(err)
+            base["lookup_stage"] = "Rate limited — using cached prices only."
+            self._emit_snapshot(base)
+            return
+        if kind == "net":
+            base["detail"] = f"Network error (retried): {err}"
+            base["lookup_stage"] = "Network error — will retry next scan."
+            self._emit_snapshot(base)
+            return
+        if kind == "err":
+            base["detail"] = str(err)
+            base["lookup_stage"] = "Search failed."
+            self._emit_snapshot(base)
+            return
+
+        if quote is None:
+            print(f"[API] No results for {search_q!r}")
+            base["detail"] = "No results for this card name."
+            base["lookup_stage"] = "No results."
+            self._emit_snapshot(base)
+            return
+
+        print(f"[API] Found: {quote.name} | {quote.set_name} | "
+              f"${quote.market_price} | {quote.printing}")
+        foil_only_lbl = "yes (SKU is foil-only)" if quote.foil_only == 1 else "no"
+        listings_lbl = (
+            str(quote.total_listings) if quote.total_listings is not None else ""
+        )
+        bundle = {
+            "tcg_name": quote.name,
+            "set_name": quote.set_name,
+            "printing": quote.printing,
+            "rarity": quote.rarity,
+            "card_number": quote.number,
+            "product_type": quote.product_type,
+            "catalog_foil_only": foil_only_lbl,
+            "listings": listings_lbl,
+            "market": f"{quote.market_price:.2f}" if quote.market_price is not None else "—",
+            "low": f"{quote.low_price:.2f}" if quote.low_price is not None else "—",
+            "median": f"{quote.median_price:.2f}" if quote.median_price is not None else "—",
+            "rate_remaining": str(quote.rate_limit_remaining)
+            if quote.rate_limit_remaining is not None
+            else "",
+            "rate_reset": quote.rate_limit_reset or "",
+            "detail": "",
+        }
+        if not quote.matched_preferred_printing:
+            want = "Foil" if self._prefer_foil else "Normal"
+            bundle["detail"] = (
+                f"No {want} row in top results; showing closest listing ({quote.printing})."
+            )
+        self._store_cache(lk, now, base, bundle)
+
     def _store_cache(self, key: str, now: float, base: dict, bundle: dict) -> None:
         self._cache_key = key
         self._cache_until = now + self._settings.price_cache_ttl_sec
+        # Preserve Vision results in the cache bundle so they survive future
+        # cache hits without re-calling the Vision API.
+        for vk in ("vision_label", "vision_tcgplayer_url"):
+            if base.get(vk) and vk not in bundle:
+                bundle[vk] = base[vk]
         bundle = {**bundle, "lookup_stage": "Last lookup succeeded; prices cached for this card."}
         self._cache_bundle = bundle
         self._emit_snapshot({**base, **bundle})
 
-    def _fetch_tcgapi(self, client: TcgApiClient, base: dict, lk: str, now: float) -> None:
+    def _fetch_tcgapi(
+        self,
+        client: TcgApiClient,
+        base: dict,
+        lk: str,
+        now: float,
+        *,
+        search_name: str | None = None,
+    ) -> None:
         self._api_http_calls += 1
-        search_q = base["ocr_name"]
+        name = (search_name or base["ocr_name"]).strip() or base["ocr_name"]
         collector = base.get("collector_number", "")
-        if collector:
-            search_q = f"{search_q} {collector}"
+
+        search_q = f"{name} {collector}".strip() if collector else name
         print(f"[API] tcgapi.dev search: {search_q!r}  (call #{self._api_http_calls})")
         base["lookup_stage"] = f"Searching: {search_q!r} …"
         self._emit_snapshot(dict(base))
+
         try:
             quote, _meta = client.quote_from_search(
                 search_q,
-                prefer_foil=self._foil_last,
+                prefer_foil=self._prefer_foil,
                 per_page=self._settings.tcgapi_per_page,
             )
+            if quote is None and collector:
+                self._api_http_calls += 1
+                print(f"[API] No results with collector#; retrying name-only: {name!r}")
+                base["detail"] = "Collector# didn't narrow results — trying name only."
+                self._emit_snapshot(dict(base))
+                quote, _meta = client.quote_from_search(
+                    name,
+                    prefer_foil=self._prefer_foil,
+                    per_page=self._settings.tcgapi_per_page,
+                )
+        except RateLimitError as e:
+            print(f"[API] RATE LIMITED: {e}")
+            base["detail"] = str(e)
+            base["lookup_stage"] = "Rate limited — using cached prices only."
+            self._emit_snapshot(base)
+            return
+        except NetworkError as e:
+            print(f"[API] NETWORK ERROR: {e}")
+            base["detail"] = f"Network error (retried): {e}"
+            base["lookup_stage"] = "Network error — will retry next scan."
+            self._emit_snapshot(base)
+            return
         except Exception as e:
             print(f"[API] ERROR: {e}")
             base["detail"] = str(e)
@@ -239,7 +536,7 @@ class ScanWorker(QThread):
             "detail": "",
         }
         if not quote.matched_preferred_printing:
-            want = "Foil" if self._foil_last else "Normal"
+            want = "Foil" if self._prefer_foil else "Normal"
             bundle["detail"] = (
                 f"No {want} row in top results; showing closest listing ({quote.printing})."
             )
@@ -281,11 +578,68 @@ class ScanWorker(QThread):
         }
         self._store_cache(lk, now, base, bundle)
 
+    def _vision_first_tick(
+        self,
+        tcgapi: TcgApiClient,
+        vision: VisionClient,
+        base: dict,
+        lk: str,
+        now: float,
+        warped,
+    ) -> None:
+        """Run Google Vision Web Detection and OCR in parallel on the first frame of a new card.
+
+        Vision label is used as the primary tcgapi search term when available; OCR name is the
+        fallback. This eliminates the multi-tick stabilization wait.
+        """
+        base["lookup_stage"] = "Vision snapshot + OCR (parallel)…"
+        self._emit_snapshot(dict(base))
+
+        def ocr_task():
+            return read_card(warped, name_only=True)
+
+        def vision_task():
+            print("[VISION] snapshot Web Detection on tick 1…")
+            return vision.analyze(warped)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_ocr = pool.submit(ocr_task)
+            fut_vis = pool.submit(vision_task)
+            ocr_result = fut_ocr.result()
+            vis_result = fut_vis.result()
+
+        vision_raw = (vis_result.best_label or "").strip()
+        ocr_name = (ocr_result.guessed_name or "").strip()
+
+        # Pick the best search term: cleaned Vision label → entity fallback → OCR.
+        search_name = _pick_vision_search_name(vis_result, ocr_name)
+
+        # Always show the raw Vision label in the overlay for transparency.
+        if vision_raw:
+            base["vision_label"] = vision_raw
+        if vis_result.tcgplayer_url:
+            base["vision_tcgplayer_url"] = vis_result.tcgplayer_url
+        if ocr_name:
+            base["ocr_name"] = ocr_name
+
+        if not search_name:
+            base["lookup_stage"] = "No card name from Vision or OCR."
+            self._emit_snapshot(base)
+            return
+
+        # Cache key uses the chosen search name so Vision-sourced results are stored separately
+        # from OCR-only lookups (avoids stale cache hits when OCR and Vision disagree).
+        if search_name != ocr_name:
+            vision_key = normalize_price_lookup_key(search_name)
+            lk = f"{lk}|v:{vision_key}"
+
+        print(f"[VISION-FIRST] raw={vision_raw!r}  search={search_name!r}  ocr={ocr_name!r}")
+        self._fetch_tcgapi(tcgapi, base, lk, now, search_name=search_name)
+
     def _reset_stable(self) -> None:
         self._stable_name = None
         self._stable_ticks = 0
-        self._foil_last = False
-        self._foil_agree_ticks = 0
+        self._empty_ticks = 0
 
 
 class OverlayWindow(QWidget):
@@ -295,6 +649,7 @@ class OverlayWindow(QWidget):
         super().__init__()
         self._settings = settings
         self._scan_region = scan_region
+        self._prefer_foil = False
         self._dragging = False
         self._drag_offset = QPoint()
 
@@ -329,6 +684,26 @@ class OverlayWindow(QWidget):
         self._body.setMinimumWidth(320)
         self._body.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
+        self._link_label = QLabel("")
+        self._link_label.setFont(QFont("Consolas", 10))
+        self._link_label.setWordWrap(True)
+        self._link_label.setStyleSheet("color: #6ab0f5;")
+        self._link_label.setTextFormat(Qt.TextFormat.RichText)
+        self._link_label.setOpenExternalLinks(True)
+        self._link_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self._link_label.setMinimumWidth(320)
+        self._link_label.hide()
+
+        self._foil_btn = QPushButton("Normal")
+        self._foil_btn.setFixedHeight(28)
+        self._foil_btn.clicked.connect(self._toggle_foil)
+        self._foil_btn.setStyleSheet(
+            "background: #3a3a4a; color: #ccc; border: none; border-radius: 4px; "
+            "padding: 0 8px; font-size: 11px;"
+        )
+
         pick_btn = QPushButton("Pick Region")
         pick_btn.setFixedHeight(28)
         pick_btn.clicked.connect(self._on_repick)
@@ -347,6 +722,7 @@ class OverlayWindow(QWidget):
         header = QHBoxLayout()
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self._foil_btn)
         header.addWidget(pick_btn)
         header.addWidget(close_btn)
 
@@ -355,6 +731,7 @@ class OverlayWindow(QWidget):
         layout.setSpacing(8)
         layout.addLayout(header)
         layout.addWidget(self._body)
+        layout.addWidget(self._link_label)
 
         self.setAutoFillBackground(True)
         self.setStyleSheet(
@@ -368,12 +745,26 @@ class OverlayWindow(QWidget):
 
         self._latest_payload: dict = {}
         self._last_digest_key: object | None = None
+        self._sticky_tcgplayer_url: str = ""
+        self._sticky_tcgplayer_label: str = ""
         self._ui_timer = QTimer(self)
         self._ui_timer.setInterval(max(100, settings.ui_refresh_ms))
         self._ui_timer.timeout.connect(self._render_live_tick)
 
-        self._worker = ScanWorker(settings, self._scan_region, self)
+        self._worker = ScanWorker(settings, self._scan_region, prefer_foil=self._prefer_foil, parent=self)
         self._worker.snapshot.connect(self._on_snapshot)
+
+    def _toggle_foil(self) -> None:
+        self._prefer_foil = not self._prefer_foil
+        label = "Foil" if self._prefer_foil else "Normal"
+        self._foil_btn.setText(label)
+        self._foil_btn.setStyleSheet(
+            f"background: {'#5a3a2d' if self._prefer_foil else '#3a3a4a'}; "
+            "color: #ccc; border: none; border-radius: 4px; "
+            "padding: 0 8px; font-size: 11px;"
+        )
+        self._worker.set_foil_preference(self._prefer_foil)
+        self._worker._cache_key = None
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -399,7 +790,9 @@ class OverlayWindow(QWidget):
         if self._worker.isRunning():
             self._worker.stop()
             self._worker.wait(2000)
-        self._worker = ScanWorker(self._settings, self._scan_region, self)
+        self._sticky_tcgplayer_url = ""
+        self._sticky_tcgplayer_label = ""
+        self._worker = ScanWorker(self._settings, self._scan_region, prefer_foil=self._prefer_foil, parent=self)
         self._worker.snapshot.connect(self._on_snapshot)
         self._worker.start()
         self._body.setText("Region updated — scanning…")
@@ -431,15 +824,32 @@ class OverlayWindow(QWidget):
             ocr_key,
             err,
             data.get("api_http_calls", 0),
+            data.get("vision_label", ""),
+            data.get("vision_tcgplayer_url", ""),
         )
 
     def _on_snapshot(self, data: dict) -> None:
         self._latest_payload = data
         status = data.get("status", "")
         if status != "card":
+            # Only clear sticky link when the overlay is explicitly wiped (not a transient empty).
+            if status == "scanning":
+                self._sticky_tcgplayer_url = ""
+                self._sticky_tcgplayer_label = ""
             self._last_digest_key = None
             self._render_body(data)
             return
+
+        # Update sticky link whenever a fresh URL arrives.
+        new_url = (data.get("vision_tcgplayer_url") or "").strip()
+        new_label = (data.get("tcg_name") or data.get("vision_label") or data.get("ocr_name") or "").strip()
+        if new_url:
+            self._sticky_tcgplayer_url = new_url
+            self._sticky_tcgplayer_label = new_label
+        elif new_label and new_label != self._sticky_tcgplayer_label:
+            # A clearly different card has been identified without a URL — drop the old link.
+            self._sticky_tcgplayer_url = ""
+            self._sticky_tcgplayer_label = new_label
 
         key = self._digest_key(data)
         if key != self._last_digest_key:
@@ -464,28 +874,36 @@ class OverlayWindow(QWidget):
             return
         if status == "scanning":
             self._body.setText("Scanning for card…")
+            self._link_label.hide()
             return
         if status == "ocr_missing":
             self._body.setText(data.get("detail", "Install OCR: pip install .[ocr]"))
+            self._link_label.hide()
             return
         if status == "error":
             self._body.setText(data.get("detail", "Unknown error"))
+            self._link_label.hide()
             return
 
         tcg_name = (data.get("tcg_name") or "").strip()
         ocr_name = (data.get("ocr_name") or "").strip()
+        collector = (data.get("collector_number") or "").strip()
+        card_number = (data.get("card_number") or "").strip()
+        display_number = card_number or collector or ""
         display_name = tcg_name or ocr_name or "—"
+        if display_number:
+            display_name = f"{display_name}  ({display_number})"
         display_set = (data.get("set_name") or "").strip() or "—"
         market = (data.get("market") or "").strip() or "—"
         if market != "—" and not market.startswith("$"):
             market = f"${market}"
 
-        scan_foil = (data.get("foil_guess") or "—").strip()
+        foil_pref = (data.get("foil_guess") or "Normal").strip()
         listing_print = (data.get("printing") or "").strip()
         if listing_print:
-            foil_line = f"Foil: {scan_foil} (video) · {listing_print} (listing)"
+            foil_line = f"Printing: {foil_pref} · {listing_print} (listing)"
         else:
-            foil_line = f"Foil: {scan_foil} (video)"
+            foil_line = f"Printing: {foil_pref}"
 
         lines = [
             f"Name: {display_name}",
@@ -494,6 +912,10 @@ class OverlayWindow(QWidget):
             f"NM market: {market}",
         ]
 
+        vision_label = (data.get("vision_label") or "").strip()
+        if vision_label:
+            lines.append(f"Vision: {self._truncate_line(vision_label, 60)}  ✓")
+
         stage = (data.get("lookup_stage") or "").strip()
         if stage and not tcg_name:
             lines.append(stage)
@@ -501,10 +923,24 @@ class OverlayWindow(QWidget):
             lines.append(self._truncate_line(str(data["detail"]), 72))
 
         ocr_raw = (data.get("ocr_lines") or "").strip()
-        if ocr_raw and not tcg_name:
+        if ocr_raw and not tcg_name and not vision_label:
             lines.append(f"OCR: {self._truncate_line(ocr_raw, 64)}")
 
         self._body.setText("\n".join(lines))
+
+        # Use current snapshot URL when available; fall back to sticky URL from last good result.
+        tcgplayer_url = (data.get("vision_tcgplayer_url") or "").strip() or self._sticky_tcgplayer_url
+        if tcgplayer_url:
+            short_url = tcgplayer_url
+            if len(short_url) > 60:
+                short_url = short_url[:57] + "…"
+            self._link_label.setText(
+                f'TCGPlayer: <a href="{tcgplayer_url}" style="color:#6ab0f5;">'
+                f"{short_url}</a>"
+            )
+            self._link_label.show()
+        else:
+            self._link_label.hide()
 
 
 def run_app() -> int:
