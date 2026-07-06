@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Whatnot Price Checker",
+  "version": "0.2.0",
+  "description": "Press W while watching a Whatnot stream to identify the card on screen and see live pricing.",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1:8743/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.whatnot.com/*", "https://whatnot.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["overlay.css"],
+      "matches": ["https://www.whatnot.com/*", "https://whatnot.com/*"]
+    }
+  ]
+}

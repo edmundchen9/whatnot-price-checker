@@ -1,6 +1,10 @@
 """
 Fullscreen overlay spanning ALL monitors that lets the user draw a rectangle.
-Emits absolute screen pixel coordinates (left, top, width, height).
+Emits absolute screen coordinates (left, top, width, height) in the same
+logical-point units as ``mss.monitors`` / Qt widget geometry — NOT raw
+physical pixels (those can differ by the display's device pixel ratio on
+HiDPI/Retina screens). ``capture.py``'s ``grab_region`` passes these straight
+to ``mss.grab()``, which expects that same logical-point coordinate system.
 """
 from __future__ import annotations
 
@@ -12,15 +16,31 @@ from PySide6.QtWidgets import QPushButton, QWidget
 
 
 def _grab_all_monitors() -> tuple[QPixmap, dict]:
-    """Grab the combined virtual screen (all monitors) as a QPixmap."""
+    """Grab the combined virtual screen (all monitors) as a QPixmap.
+
+    On HiDPI/Retina displays, ``mss``'s ``monitors`` bounds are reported in
+    *logical points* (matching Qt's coordinate system for widgets/mouse
+    events), but ``sct.grab()`` returns the image at *physical pixel*
+    resolution (e.g. 2x on Retina). The returned pixmap's device pixel ratio
+    is set accordingly so it draws at the correct logical size — without
+    this, the picker window would be sized in physical pixels while Qt treats
+    that as logical points, making it ~2x too large and causing the drawn
+    selection rectangle to land on the wrong part of the screen.
+    """
     with mss.mss() as sct:
-        mon = sct.monitors[0]  # 0 = combined bounding box of all monitors
+        mon = sct.monitors[0]  # 0 = combined bounding box of all monitors, in logical points
         shot = sct.grab(mon)
         bgra = np.asarray(shot, dtype=np.uint8)
         rgb = bgra[:, :, 2::-1].copy()
         h, w = rgb.shape[:2]
         img = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
-    return QPixmap.fromImage(img), mon
+    pixmap = QPixmap.fromImage(img)
+    mon_w, mon_h = int(mon["width"]), int(mon["height"])
+    if mon_w > 0 and mon_h > 0:
+        dpr = max(pixmap.width() / mon_w, pixmap.height() / mon_h)
+        if dpr > 0:
+            pixmap.setDevicePixelRatio(dpr)
+    return pixmap, mon
 
 
 class RegionPicker(QWidget):
@@ -44,9 +64,12 @@ class RegionPicker(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setCursor(Qt.CursorShape.CrossCursor)
+        # Use the *logical*-point monitor size (matching mss.monitors / Qt's own
+        # coordinate system), not the screenshot's raw physical-pixel size —
+        # see _grab_all_monitors() for why those differ on Retina displays.
         self.setGeometry(
             self._virt_left, self._virt_top,
-            self._screenshot.width(), self._screenshot.height(),
+            int(mon["width"]), int(mon["height"]),
         )
 
         self._btn = QPushButton("Use Region", self)
@@ -71,7 +94,7 @@ class RegionPicker(QWidget):
 
             p.setPen(QColor(220, 220, 220))
             p.setFont(QFont("Segoe UI", 10))
-            dims = f"{self._rect.width()} x {self._rect.height()} px"
+            dims = f"{self._rect.width()} x {self._rect.height()} pt"
             p.drawText(self._rect.left() + 6, self._rect.top() - 10, dims)
 
         p.setPen(QColor(255, 255, 255))
@@ -85,7 +108,7 @@ class RegionPicker(QWidget):
         p.drawText(
             self.rect().adjusted(0, 95, 0, 0),
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-            "Click and drag \u2014 then press Use Region. Press S in the overlay to scan.",
+            "Click and drag \u2014 then press Use Region. Press W in the overlay to scan.",
         )
         p.end()
 

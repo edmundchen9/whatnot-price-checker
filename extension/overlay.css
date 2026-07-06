@@ -1,0 +1,292 @@
+/* Injected into a shadow root by content.js — fully isolated from Whatnot's
+   page styles. Ported 1:1 from the Qt desktop overlay (app.py:OverlayWindow)
+   so the look stays identical between the legacy app and the extension. */
+
+:host {
+  all: initial;
+}
+
+* {
+  box-sizing: border-box;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+.wpc-panel {
+  position: fixed;
+  top: 90px;
+  right: 24px;
+  width: 310px;
+  background-color: #15151a;
+  border: 1px solid #2c2c36;
+  border-radius: 10px;
+  padding: 10px 12px 12px 12px;
+  color: #d0d0d0;
+  z-index: 2147483647;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  user-select: none;
+}
+
+.wpc-panel.wpc-hidden {
+  display: none;
+}
+
+/* --- Header ------------------------------------------------------------ */
+
+.wpc-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: move;
+  padding-bottom: 8px;
+}
+
+.wpc-status-dot {
+  color: #5a5a68;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.wpc-title {
+  color: #e8e8e8;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.wpc-spacer {
+  flex: 1 1 auto;
+}
+
+.wpc-close-btn {
+  width: 24px;
+  height: 24px;
+  background: #333;
+  color: #eee;
+  border: none;
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.wpc-close-btn:hover {
+  background: #3d3d3d;
+}
+
+/* --- Toolbar ------------------------------------------------------------ */
+
+.wpc-toolbar {
+  display: flex;
+  gap: 6px;
+  padding-bottom: 8px;
+}
+
+.wpc-toolbar button {
+  height: 26px;
+  border: none;
+  border-radius: 4px;
+  font-size: 11px;
+  padding: 0 10px;
+  cursor: pointer;
+  color: #eee;
+}
+
+.wpc-foil-btn {
+  background: #3a3a4a;
+  color: #ccc;
+}
+.wpc-foil-btn.wpc-foil-active {
+  background: #5a3a2d;
+}
+
+.wpc-scan-btn {
+  background: #2d4f7a;
+}
+.wpc-scan-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* --- Tabs --------------------------------------------------------------- */
+
+.wpc-tabs {
+  display: flex;
+  gap: 18px;
+  padding-bottom: 8px;
+}
+
+.wpc-tab {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding-bottom: 4px;
+}
+
+.wpc-tab-active {
+  color: #3ddc84;
+  border-bottom: 2px solid #3ddc84;
+}
+
+.wpc-tab-disabled {
+  color: #4a4a56;
+}
+
+/* --- Status text (idle / capturing / error) ----------------------------- */
+
+.wpc-status-label {
+  color: #b8b8c0;
+  font-size: 12px;
+  line-height: 1.4;
+  min-width: 270px;
+}
+
+/* --- Card body ----------------------------------------------------------- */
+
+.wpc-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wpc-top-row {
+  display: flex;
+  gap: 12px;
+}
+
+.wpc-thumb {
+  width: 96px;
+  height: 132px;
+  background: #0c0c10;
+  border: 1px solid #2c2c36;
+  border-radius: 8px;
+  object-fit: contain;
+  flex: 0 0 auto;
+}
+
+.wpc-price-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wpc-condition-caption {
+  color: #8a8a98;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.wpc-price {
+  color: #666;
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+.wpc-price.wpc-price-set {
+  color: #3ddc84;
+}
+
+.wpc-source-caption {
+  color: #6e6e7a;
+  font-size: 10px;
+}
+
+.wpc-change-label {
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.wpc-name {
+  color: #f0f0f2;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.wpc-set {
+  color: #b0b0ba;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.wpc-number {
+  color: #8a8a98;
+  font-size: 10px;
+}
+
+.wpc-tag-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.wpc-pill {
+  border-radius: 9px;
+  padding: 2px 8px;
+  font-size: 9px;
+  font-weight: 700;
+  display: none;
+}
+.wpc-pill.wpc-pill-visible {
+  display: inline-block;
+}
+
+.wpc-conditions-caption {
+  color: #8a8a98;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.wpc-conditions-row {
+  display: flex;
+  gap: 4px;
+}
+
+.wpc-condition-btn {
+  width: 50px;
+  height: 36px;
+  background: #2a2a34;
+  color: #d0d0d0;
+  border: 1px solid #3d3d4a;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.3;
+  padding: 2px;
+  cursor: pointer;
+  white-space: pre-line;
+}
+.wpc-condition-btn.wpc-condition-selected {
+  background: #2d6e4f;
+  border-color: #3ddc84;
+  color: #eafff0;
+}
+.wpc-condition-btn:disabled {
+  color: #555560;
+  border-color: #2c2c36;
+  cursor: default;
+}
+
+.wpc-view-btn {
+  height: 32px;
+  background: #1f3d2c;
+  color: #3ddc84;
+  border: 1px solid #2d6e4f;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.wpc-view-btn:disabled {
+  color: #555560;
+  background: #232328;
+  border-color: #2c2c36;
+  cursor: default;
+}
+
+.wpc-footer {
+  color: #5a5a68;
+  font-size: 9px;
+  line-height: 1.4;
+}

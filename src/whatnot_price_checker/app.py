@@ -6,14 +6,44 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QFont, QKeySequence, QShortcut
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+import cv2
+import numpy as np
+from PySide6.QtCore import QPoint, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QDesktopServices,
+    QFont,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+    QShortcut,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
-from whatnot_price_checker.capture import Region, grab_region
+from whatnot_price_checker import __version__
+from whatnot_price_checker.capture import (
+    Region,
+    grab_region,
+    has_screen_recording_access,
+    request_screen_recording_access,
+)
 from whatnot_price_checker.card import warp_for_ocr
 from whatnot_price_checker.config import Settings, normalize_price_lookup_key
+from whatnot_price_checker.justtcg_client import CONDITION_ORDER, JustTcgClient
+from whatnot_price_checker.justtcg_client import NetworkError as JustTcgNetworkError
+from whatnot_price_checker.justtcg_client import RateLimitError as JustTcgRateLimitError
 from whatnot_price_checker.ocr_reader import read_card
+from whatnot_price_checker.region_store import load_region, save_region
 from whatnot_price_checker.tcgapi_client import NetworkError, RateLimitError, TcgApiClient
 from whatnot_price_checker.tcgplayer import TcgClient
 from whatnot_price_checker.vision_client import VisionClient, VisionResult
@@ -131,6 +161,78 @@ def _compact_tcgplayer_search_name(candidate: str, fallback: str) -> str:
     return " ".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Overlay display helpers (confidence/price tags, thumbnail, condition matching)
+# ---------------------------------------------------------------------------
+
+def _normalize_collector(value: str) -> str:
+    prefix = value.split("/", 1)[0]
+    digits = "".join(ch for ch in prefix.lower() if ch.isalnum()).lstrip("0")
+    return digits
+
+
+def _collector_matches(a: str, b: str) -> bool:
+    na, nb = _normalize_collector(a), _normalize_collector(b)
+    return bool(na) and na == nb
+
+
+def _confidence_label(data: dict) -> tuple[str, str]:
+    """Return (label, color) describing how trustworthy the current match is."""
+    if not (data.get("tcg_name") or "").strip():
+        return "NO MATCH", "#8a8a98"
+    collector = (data.get("collector_number") or "").strip()
+    card_number = (data.get("card_number") or "").strip()
+    detail = (data.get("detail") or "").strip()
+    if collector and card_number and _collector_matches(collector, card_number) and not detail:
+        return "HIGH CONFIDENCE", "#3ddc84"
+    if collector and card_number and not _collector_matches(collector, card_number):
+        return "LOW CONFIDENCE", "#e0744d"
+    return "MEDIUM CONFIDENCE", "#e0c34d"
+
+
+def _price_tier_label(market: str) -> str:
+    try:
+        val = float(market)
+    except (TypeError, ValueError):
+        return ""
+    if val < 5:
+        return "Bulk <$5"
+    if val < 25:
+        return "Mid $5–$25"
+    return "Chase $25+"
+
+
+def _bgr_to_pixmap(bgr: np.ndarray, width: int, height: int) -> QPixmap:
+    """Convert a captured BGR frame into a scaled QPixmap thumbnail."""
+    rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    h, w = rgb.shape[:2]
+    qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+    pix = QPixmap.fromImage(qimg)
+    return pix.scaled(
+        width,
+        height,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
+def _rounded_pixmap(pixmap: QPixmap, radius: int) -> QPixmap:
+    """Clip a pixmap to rounded corners (for the card thumbnail)."""
+    if pixmap.isNull():
+        return pixmap
+    size = pixmap.size()
+    out = QPixmap(size)
+    out.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(0, 0, size.width(), size.height(), radius, radius)
+    painter.setClipPath(path)
+    painter.drawPixmap(0, 0, pixmap)
+    painter.end()
+    return out
+
+
 class ScanWorker(QThread):
     snapshot = Signal(dict)
 
@@ -168,9 +270,13 @@ class ScanWorker(QThread):
         if self._settings.google_vision_key:
             vision = VisionClient(self._settings.google_vision_key)
 
+        justtcg: JustTcgClient | None = None
+        if self._settings.justtcg_api_key:
+            justtcg = JustTcgClient(self._settings.justtcg_api_key)
+
         try:
             try:
-                self._tick(None, tcgplayer, vision)
+                self._tick(None, tcgplayer, vision, justtcg)
             except Exception as e:
                 self._emit_snapshot({"status": "error", "detail": str(e)})
         finally:
@@ -178,6 +284,8 @@ class ScanWorker(QThread):
                 tcgplayer.close()
             if vision is not None:
                 vision.close()
+            if justtcg is not None:
+                justtcg.close()
 
     def _sleep_cancellable(self, total_ms: int) -> None:
         remaining = total_ms
@@ -191,6 +299,7 @@ class ScanWorker(QThread):
         tcgapi: TcgApiClient | None,
         tcgplayer: TcgClient | None,
         vision: VisionClient | None = None,
+        justtcg: JustTcgClient | None = None,
     ) -> None:
         if self._stop or self.isInterruptionRequested():
             return
@@ -198,7 +307,7 @@ class ScanWorker(QThread):
         warped, warp_source = warp_for_ocr(frame)
         if warped is None:
             self._reset_stable()
-            self._emit_snapshot({"status": "idle", "detail": "No card-shaped region found in screenshot. Press S to try again."})
+            self._emit_snapshot({"status": "idle", "detail": "No card-shaped region found in screenshot. Press W to try again."})
             return
 
         try:
@@ -240,6 +349,12 @@ class ScanWorker(QThread):
             "lookup_stage": "",
             "vision_label": "",
             "vision_tcgplayer_url": "",
+            "condition_prices": {},
+            "price_source": "",
+            "lookup_ms": 0,
+            "tcgplayer_id": "",
+            "price_change_24h": None,
+            "warp_frame": warped,
         }
 
         if not name:
@@ -256,9 +371,10 @@ class ScanWorker(QThread):
         else:
             self._stable_ticks += 1
 
-        if tcgplayer is None:
+        if tcgplayer is None and justtcg is None:
             base["detail"] = (
-                "Set TCGPLAYER_ACCESS_TOKEN or TCGPLAYER_PUBLIC_KEY/TCGPLAYER_PRIVATE_KEY for prices."
+                "Set TCGPLAYER_ACCESS_TOKEN/TCGPLAYER_PUBLIC_KEY+PRIVATE_KEY or "
+                "JUSTTCG_API_KEY for prices."
             )
             base["lookup_stage"] = "No price API key configured."
             self._emit_snapshot(base)
@@ -281,7 +397,7 @@ class ScanWorker(QThread):
             self._emit_snapshot({**base, **self._cache_bundle})
             return
 
-        self._fetch_tcgplayer(tcgplayer, base, lk, now, search_name=search_name)
+        self._fetch_tcgplayer(tcgplayer, base, lk, now, search_name=search_name, justtcg=justtcg)
 
     def _emit_snapshot(self, payload: dict) -> None:
         out = dict(payload)
@@ -522,53 +638,127 @@ class ScanWorker(QThread):
 
     def _fetch_tcgplayer(
         self,
-        client: TcgClient,
+        client: TcgClient | None,
         base: dict,
         lk: str,
         now: float,
         *,
         search_name: str | None = None,
+        justtcg: JustTcgClient | None = None,
     ) -> None:
-        self._api_http_calls += 1
         name = (search_name or base["ocr_name"]).strip() or base["ocr_name"]
         collector = (base.get("collector_number") or "").strip()
-        base["lookup_stage"] = f"TCGPlayer search: {name!r} (shot #{self._api_http_calls})…"
-        self._emit_snapshot(dict(base))
-        try:
-            quote = client.quote_best_match(
-                name,
-                collector_number=collector,
-                prefer_foil=self._prefer_foil,
-            )
-        except Exception as e:
-            base["detail"] = str(e)
-            base["lookup_stage"] = "TCGPlayer request failed."
+        bundle: dict = {}
+
+        if client is not None:
+            self._api_http_calls += 1
+            base["lookup_stage"] = f"TCGPlayer search: {name!r} (shot #{self._api_http_calls})…"
+            self._emit_snapshot(dict(base))
+            try:
+                quote = client.quote_best_match(
+                    name,
+                    collector_number=collector,
+                    prefer_foil=self._prefer_foil,
+                )
+            except Exception as e:
+                base["detail"] = str(e)
+                base["lookup_stage"] = "TCGPlayer request failed."
+                self._emit_snapshot(base)
+                quote = None
+
+            if quote is None and justtcg is None:
+                base["detail"] = "No TCGPlayer catalog match."
+                base["lookup_stage"] = "No catalog match (call still counted)."
+                self._emit_snapshot(base)
+                return
+
+            if quote is not None:
+                bundle = {
+                    "tcg_name": quote.name,
+                    "set_name": quote.set_name,
+                    "printing": quote.printing or ("Holofoil" if self._prefer_foil else "Normal"),
+                    "rarity": quote.rarity,
+                    "card_number": quote.number,
+                    "product_type": "",
+                    "catalog_foil_only": "",
+                    "listings": "",
+                    "market": f"{quote.market_price:.2f}" if quote.market_price is not None else "—",
+                    "low": f"{quote.low_price:.2f}" if quote.low_price is not None else "—",
+                    "median": f"{quote.mid_price:.2f}" if quote.mid_price is not None else "—",
+                    "rate_remaining": "",
+                    "rate_reset": "",
+                    "detail": "",
+                }
+
+        self._attach_justtcg(bundle, justtcg, search_name=name, collector=collector)
+
+        if not bundle:
+            base["detail"] = "No catalog match from any price source."
+            base["lookup_stage"] = "No catalog match."
             self._emit_snapshot(base)
             return
 
-        if quote is None:
-            base["detail"] = "No TCGPlayer catalog match."
-            base["lookup_stage"] = "No catalog match (call still counted)."
-            self._emit_snapshot(base)
-            return
-
-        bundle = {
-            "tcg_name": quote.name,
-            "set_name": quote.set_name,
-            "printing": quote.printing or ("Holofoil" if self._prefer_foil else "Normal"),
-            "rarity": quote.rarity,
-            "card_number": quote.number,
-            "product_type": "",
-            "catalog_foil_only": "",
-            "listings": "",
-            "market": f"{quote.market_price:.2f}" if quote.market_price is not None else "—",
-            "low": f"{quote.low_price:.2f}" if quote.low_price is not None else "—",
-            "median": f"{quote.mid_price:.2f}" if quote.mid_price is not None else "—",
-            "rate_remaining": "",
-            "rate_reset": "",
-            "detail": "",
-        }
         self._store_cache(lk, now, base, bundle)
+
+    def _attach_justtcg(
+        self,
+        bundle: dict,
+        justtcg: JustTcgClient | None,
+        *,
+        search_name: str,
+        collector: str,
+    ) -> None:
+        """Fill the NM/LP/MP/HP/DM condition grid from JustTCG (the only source that has it).
+
+        Also backfills name/set/rarity/market price into ``bundle`` when no other
+        backend supplied them (e.g. TCGPlayer isn't configured).
+        """
+        if justtcg is None:
+            return
+        start = time.perf_counter()
+        try:
+            cards = justtcg.search(search_name)
+            card = justtcg.best_match(cards, collector)
+        except JustTcgRateLimitError as e:
+            bundle.setdefault("detail", str(e))
+            return
+        except JustTcgNetworkError as e:
+            bundle.setdefault("detail", f"JustTCG network error: {e}")
+            return
+        except Exception as e:
+            bundle.setdefault("detail", f"JustTCG lookup failed: {e}")
+            return
+
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        if card is None:
+            return
+
+        printing = JustTcgClient.best_printing(card, prefer_foil=self._prefer_foil)
+        conditions = JustTcgClient.conditions_for_printing(card, printing)
+        nm_variant = next(
+            (v for v in card.variants if v.condition == "NM" and v.printing == printing),
+            None,
+        )
+
+        bundle["condition_prices"] = conditions
+        bundle["price_source"] = "JustTCG"
+        bundle["lookup_ms"] = elapsed_ms
+        if card.tcgplayer_id:
+            bundle["tcgplayer_id"] = card.tcgplayer_id
+        if nm_variant is not None:
+            bundle["price_change_24h"] = nm_variant.price_change_24h
+
+        if not bundle.get("tcg_name") and card.name:
+            bundle["tcg_name"] = card.name
+        if not bundle.get("set_name") and card.set_name:
+            bundle["set_name"] = card.set_name
+        if not bundle.get("rarity") and card.rarity:
+            bundle["rarity"] = card.rarity
+        if not bundle.get("printing"):
+            bundle["printing"] = printing
+        nm_price = conditions.get("NM")
+        if (not bundle.get("market") or bundle.get("market") == "—") and nm_price is not None:
+            bundle["market"] = f"{nm_price:.2f}"
 
     def _vision_first_tick(
         self,
@@ -634,6 +824,43 @@ class ScanWorker(QThread):
         self._empty_ticks = 0
 
 
+_STATUS_DEFAULT_MESSAGES: dict[str, str] = {
+    "idle": "Press W to screenshot and scan the selected region.",
+    "capturing": "Capturing screenshot and reading card…",
+    "ocr_missing": "Install OCR: pip install .[ocr]",
+    "error": "Unknown error.",
+}
+
+_STATUS_DOT_COLORS: dict[str, str] = {
+    "ok": "#3ddc84",
+    "warn": "#e0c34d",
+    "idle": "#5a5a68",
+    "error": "#e0744d",
+}
+
+_CONDITION_CAPTIONS: dict[str, str] = {
+    "NM": "NEAR MINT",
+    "LP": "LIGHTLY PLAYED",
+    "MP": "MODERATELY PLAYED",
+    "HP": "HEAVILY PLAYED",
+    "DM": "DAMAGED",
+}
+
+_CONFIDENCE_BG: dict[str, str] = {
+    "#3ddc84": "#1f3d2c",
+    "#e0c34d": "#3d3520",
+    "#e0744d": "#3d2820",
+    "#8a8a98": "#2a2a34",
+}
+
+
+def _pill_style(fg: str, bg: str) -> str:
+    return (
+        f"color: {fg}; background: {bg}; border-radius: 9px; "
+        "padding: 2px 8px; font-size: 9px; font-weight: 700;"
+    )
+
+
 class OverlayWindow(QWidget):
     request_repick = Signal()
 
@@ -644,16 +871,9 @@ class OverlayWindow(QWidget):
         self._prefer_foil = False
         self._dragging = False
         self._drag_offset = QPoint()
-
-        if (
-            settings.tcgplayer_access_token
-            or (
-                settings.tcgplayer_public_key and settings.tcgplayer_private_key
-            )
-        ):
-            subtitle = "Whatnot · TCGPlayer API"
-        else:
-            subtitle = "Whatnot · price checker"
+        self._selected_condition = "NM"
+        self._view_url = ""
+        self._scan_count = 0
 
         self.setWindowTitle("Whatnot price checker")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -663,40 +883,26 @@ class OverlayWindow(QWidget):
             | Qt.WindowType.Tool
         )
 
-        title = QLabel(subtitle)
-        title.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        title.setStyleSheet("color: #e8e8e8;")
+        # --- Header: status dot + title + controls -------------------------
+        self._status_dot = QLabel("●")
+        self._status_dot.setStyleSheet(f"color: {_STATUS_DOT_COLORS['idle']}; font-size: 13px;")
+        self._status_dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        title = QLabel("WHATNOT PRICE CHECKER")
+        title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        title.setStyleSheet("color: #e8e8e8; letter-spacing: 1px;")
         title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
-        self._body = QLabel("")
-        self._body.setFont(QFont("Consolas", 10))
-        self._body.setWordWrap(True)
-        self._body.setStyleSheet("color: #d0d0d0;")
-        self._body.setMinimumWidth(320)
-        self._body.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-
-        self._link_label = QLabel("")
-        self._link_label.setFont(QFont("Consolas", 10))
-        self._link_label.setWordWrap(True)
-        self._link_label.setStyleSheet("color: #6ab0f5;")
-        self._link_label.setTextFormat(Qt.TextFormat.RichText)
-        self._link_label.setOpenExternalLinks(True)
-        self._link_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.LinksAccessibleByMouse
-        )
-        self._link_label.setMinimumWidth(320)
-        self._link_label.hide()
-
         self._foil_btn = QPushButton("Normal")
-        self._foil_btn.setFixedHeight(28)
+        self._foil_btn.setFixedHeight(26)
         self._foil_btn.clicked.connect(self._toggle_foil)
         self._foil_btn.setStyleSheet(
             "background: #3a3a4a; color: #ccc; border: none; border-radius: 4px; "
             "padding: 0 8px; font-size: 11px;"
         )
 
-        self._scan_btn = QPushButton("Scan (S)")
-        self._scan_btn.setFixedHeight(28)
+        self._scan_btn = QPushButton("Scan (W)")
+        self._scan_btn.setFixedHeight(26)
         self._scan_btn.clicked.connect(self.trigger_scan)
         self._scan_btn.setStyleSheet(
             "background: #2d4f7a; color: #eee; border: none; border-radius: 4px; "
@@ -704,7 +910,7 @@ class OverlayWindow(QWidget):
         )
 
         pick_btn = QPushButton("Pick Region")
-        pick_btn.setFixedHeight(28)
+        pick_btn.setFixedHeight(26)
         pick_btn.clicked.connect(self._on_repick)
         pick_btn.setStyleSheet(
             "background: #2d5a2d; color: #ccc; border: none; border-radius: 4px; "
@@ -712,36 +918,182 @@ class OverlayWindow(QWidget):
         )
 
         close_btn = QPushButton("×")
-        close_btn.setFixedSize(28, 28)
+        close_btn.setFixedSize(26, 26)
         close_btn.clicked.connect(self.close)
         close_btn.setStyleSheet(
             "background: #333; color: #eee; border: none; border-radius: 4px;"
         )
 
         header = QHBoxLayout()
+        header.addWidget(self._status_dot)
         header.addWidget(title)
         header.addStretch(1)
-        header.addWidget(self._foil_btn)
-        header.addWidget(self._scan_btn)
-        header.addWidget(pick_btn)
         header.addWidget(close_btn)
 
+        # Action buttons live on their own row so the title bar stays slim —
+        # keeps the window narrow instead of stretching it to fit every button.
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+        toolbar.addWidget(self._foil_btn)
+        toolbar.addWidget(self._scan_btn)
+        toolbar.addWidget(pick_btn)
+        toolbar.addStretch(1)
+
+        # --- Tabs (Scanner is the only implemented view; Collection is a
+        # decorative placeholder for visual parity, not a real feature) -----
+        tabs_row = QHBoxLayout()
+        tabs_row.setSpacing(18)
+        scanner_tab = QLabel("SCANNER")
+        scanner_tab.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        scanner_tab.setStyleSheet(
+            "color: #3ddc84; border-bottom: 2px solid #3ddc84; padding-bottom: 4px; letter-spacing: 1px;"
+        )
+        collection_tab = QLabel("COLLECTION")
+        collection_tab.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        collection_tab.setStyleSheet("color: #4a4a56; padding-bottom: 4px; letter-spacing: 1px;")
+        collection_tab.setToolTip("Coming soon")
+        tabs_row.addWidget(scanner_tab)
+        tabs_row.addWidget(collection_tab)
+        tabs_row.addStretch(1)
+
+        # --- Status message (idle/capturing/error/no-match) ----------------
+        self._status_label = QLabel("")
+        self._status_label.setFont(QFont("Segoe UI", 10))
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet("color: #b8b8c0;")
+        self._status_label.setMinimumWidth(270)
+
+        # --- Card view (shown once a card has been identified) -------------
+        self._card_widget = QWidget()
+        card_layout = QVBoxLayout(self._card_widget)
+        card_layout.setContentsMargins(0, 0, 0, 0)
+        card_layout.setSpacing(8)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
+
+        self._thumb_label = QLabel()
+        self._thumb_label.setFixedSize(96, 132)
+        self._thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._thumb_label.setStyleSheet(
+            "background: #0c0c10; border: 1px solid #2c2c36; border-radius: 8px;"
+        )
+        top_row.addWidget(self._thumb_label)
+
+        price_col = QVBoxLayout()
+        price_col.setSpacing(2)
+        self._condition_caption = QLabel(_CONDITION_CAPTIONS["NM"])
+        self._condition_caption.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._condition_caption.setStyleSheet("color: #8a8a98; letter-spacing: 1px;")
+        self._price_label = QLabel("—")
+        self._price_label.setFont(QFont("Segoe UI", 24, QFont.Weight.Bold))
+        self._price_label.setStyleSheet("color: #666;")
+        self._source_caption = QLabel("")
+        self._source_caption.setFont(QFont("Segoe UI", 9))
+        self._source_caption.setStyleSheet("color: #6e6e7a;")
+        self._change_label = QLabel("")
+        self._change_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        price_col.addWidget(self._condition_caption)
+        price_col.addWidget(self._price_label)
+        price_col.addWidget(self._source_caption)
+        price_col.addWidget(self._change_label)
+        price_col.addStretch(1)
+        top_row.addLayout(price_col)
+        top_row.addStretch(1)
+        card_layout.addLayout(top_row)
+
+        self._name_label = QLabel("—")
+        self._name_label.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        self._name_label.setStyleSheet("color: #f0f0f2;")
+        self._name_label.setWordWrap(True)
+        self._set_label = QLabel("—")
+        self._set_label.setFont(QFont("Segoe UI", 10))
+        self._set_label.setStyleSheet("color: #b0b0ba;")
+        self._set_label.setWordWrap(True)
+        self._number_label = QLabel("")
+        self._number_label.setFont(QFont("Segoe UI", 9))
+        self._number_label.setStyleSheet("color: #8a8a98;")
+        card_layout.addWidget(self._name_label)
+        card_layout.addWidget(self._set_label)
+        card_layout.addWidget(self._number_label)
+
+        tag_row = QHBoxLayout()
+        tag_row.setSpacing(6)
+        self._confidence_tag = QLabel("")
+        self._confidence_tag.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self._tier_tag = QLabel("")
+        self._tier_tag.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self._tier_tag.setStyleSheet(_pill_style("#6ab0f5", "#1c2e3d"))
+        tag_row.addWidget(self._confidence_tag)
+        tag_row.addWidget(self._tier_tag)
+        tag_row.addStretch(1)
+        card_layout.addLayout(tag_row)
+
+        self._conditions_caption = QLabel("CONDITIONS")
+        self._conditions_caption.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self._conditions_caption.setStyleSheet("color: #8a8a98; letter-spacing: 1px;")
+        card_layout.addWidget(self._conditions_caption)
+
+        conditions_row = QHBoxLayout()
+        conditions_row.setSpacing(4)
+        self._condition_group = QButtonGroup(self)
+        self._condition_group.setExclusive(True)
+        self._condition_buttons: dict[str, QPushButton] = {}
+        for code in CONDITION_ORDER:
+            btn = QPushButton(f"{code}\n—")
+            btn.setCheckable(True)
+            btn.setFixedSize(50, 36)
+            btn.setStyleSheet(
+                "QPushButton { background: #2a2a34; color: #d0d0d0; border: 1px solid #3d3d4a; "
+                "border-radius: 6px; font-size: 10px; font-weight: 600; padding: 2px; }"
+                "QPushButton:checked { background: #2d6e4f; border-color: #3ddc84; color: #eafff0; }"
+                "QPushButton:disabled { color: #555560; border-color: #2c2c36; }"
+            )
+            btn.clicked.connect(lambda _checked=False, c=code: self._on_condition_clicked(c))
+            self._condition_group.addButton(btn)
+            self._condition_buttons[code] = btn
+            conditions_row.addWidget(btn)
+        self._condition_buttons["NM"].setChecked(True)
+        card_layout.addLayout(conditions_row)
+
+        self._view_btn = QPushButton("VIEW ON TCGPLAYER  ›")
+        self._view_btn.setFixedHeight(32)
+        self._view_btn.setEnabled(False)
+        self._view_btn.clicked.connect(self._open_tcgplayer)
+        self._view_btn.setStyleSheet(
+            "QPushButton { background: #1f3d2c; color: #3ddc84; border: 1px solid #2d6e4f; "
+            "border-radius: 6px; font-size: 11px; font-weight: 700; } "
+            "QPushButton:disabled { color: #555560; background: #232328; border-color: #2c2c36; }"
+        )
+        card_layout.addWidget(self._view_btn)
+
+        self._footer_label = QLabel("")
+        self._footer_label.setFont(QFont("Segoe UI", 8))
+        self._footer_label.setStyleSheet("color: #5a5a68;")
+        self._footer_label.setWordWrap(True)
+        card_layout.addWidget(self._footer_label)
+
+        self._card_widget.hide()
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setContentsMargins(12, 10, 12, 12)
         layout.setSpacing(8)
         layout.addLayout(header)
-        layout.addWidget(self._body)
-        layout.addWidget(self._link_label)
+        layout.addLayout(toolbar)
+        layout.addLayout(tabs_row)
+        layout.addWidget(self._status_label)
+        layout.addWidget(self._card_widget)
 
         self.setAutoFillBackground(True)
         self.setStyleSheet(
             "OverlayWindow {"
-            "  background-color: #1e1e24;"
-            "  border: 1px solid #3d3d4a;"
+            "  background-color: #15151a;"
+            "  border: 1px solid #2c2c36;"
             "  border-radius: 10px;"
             "}"
         )
-        self.resize(360, 168)
+        self.resize(310, 458)
+        self.setMinimumWidth(290)
 
         self._latest_payload: dict = {}
         self._last_digest_key: object | None = None
@@ -751,11 +1103,11 @@ class OverlayWindow(QWidget):
         self._ui_timer.setInterval(max(100, settings.ui_refresh_ms))
         self._ui_timer.timeout.connect(self._render_live_tick)
 
-        self._scan_shortcut = QShortcut(QKeySequence("S"), self)
+        self._scan_shortcut = QShortcut(QKeySequence("W"), self)
         self._scan_shortcut.activated.connect(self.trigger_scan)
 
         self._worker: ScanWorker | None = None
-        self._render_body({"status": "idle", "detail": "Press S to screenshot and scan the selected region."})
+        self._render_body({"status": "idle"})
 
     def _toggle_foil(self) -> None:
         self._prefer_foil = not self._prefer_foil
@@ -768,6 +1120,14 @@ class OverlayWindow(QWidget):
         )
         if self._worker is not None and self._worker.isRunning():
             self._worker.set_foil_preference(self._prefer_foil)
+
+    def _on_condition_clicked(self, code: str) -> None:
+        self._selected_condition = code
+        self._render_body(self._latest_payload)
+
+    def _open_tcgplayer(self) -> None:
+        if self._view_url:
+            QDesktopServices.openUrl(QUrl(self._view_url))
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -798,15 +1158,17 @@ class OverlayWindow(QWidget):
         self._sticky_tcgplayer_label = ""
         self._worker = None
         self._last_digest_key = None
-        self._latest_payload = {"status": "idle", "detail": "Region updated. Press S to screenshot and scan."}
+        self._latest_payload = {"status": "idle", "detail": "Region updated. Press W to screenshot and scan."}
         self._render_body(self._latest_payload)
 
     def trigger_scan(self) -> None:
         if self._worker is not None and self._worker.isRunning():
-            self._body.setText("Scan already running…")
+            self._render_body({"status": "idle", "detail": "Scan already running…"})
             return
+        self._selected_condition = "NM"
+        self._scan_count += 1
         self._scan_btn.setEnabled(False)
-        self._latest_payload = {"status": "capturing", "detail": "Capturing screenshot and reading card…"}
+        self._latest_payload = {"status": "capturing"}
         self._render_body(self._latest_payload)
         self._worker = ScanWorker(self._settings, self._scan_region, prefer_foil=self._prefer_foil, parent=self)
         self._worker.snapshot.connect(self._on_snapshot)
@@ -820,7 +1182,7 @@ class OverlayWindow(QWidget):
         self.request_repick.emit()
 
     def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_S:
+        if event.key() == Qt.Key.Key_W:
             self.trigger_scan()
             event.accept()
             return
@@ -842,6 +1204,7 @@ class OverlayWindow(QWidget):
         """When this changes, repaint immediately (prices, catalog, OCR name identity, API errors)."""
         ocr_key = normalize_price_lookup_key(data.get("ocr_name") or "")
         err = (data.get("detail") or "") if not data.get("tcg_name") else ""
+        conditions = tuple(sorted((data.get("condition_prices") or {}).items()))
         return (
             data.get("status"),
             data.get("tcg_name"),
@@ -852,6 +1215,10 @@ class OverlayWindow(QWidget):
             data.get("api_http_calls", 0),
             data.get("vision_label", ""),
             data.get("vision_tcgplayer_url", ""),
+            conditions,
+            data.get("price_source", ""),
+            data.get("tcgplayer_id", ""),
+            data.get("rarity", ""),
         )
 
     def _on_snapshot(self, data: dict) -> None:
@@ -894,84 +1261,133 @@ class OverlayWindow(QWidget):
             return t
         return t[: max_len - 1] + "…"
 
+    def _set_status_dot(self, kind: str) -> None:
+        color = _STATUS_DOT_COLORS.get(kind, _STATUS_DOT_COLORS["idle"])
+        self._status_dot.setStyleSheet(f"color: {color}; font-size: 13px;")
+
     def _render_body(self, data: dict) -> None:
         status = data.get("status", "")
         if not status:
             return
-        if status == "idle":
-            detail = data.get("detail") or "Press S to screenshot and scan the selected region."
-            self._body.setText(str(detail))
-            self._link_label.hide()
+
+        if status != "card":
+            self._card_widget.hide()
+            self._status_label.show()
+            message = data.get("detail") or _STATUS_DEFAULT_MESSAGES.get(status, "Unknown status.")
+            self._status_label.setText(str(message))
+            self._set_status_dot("error" if status == "error" else "idle")
             return
-        if status == "capturing":
-            self._body.setText(data.get("detail", "Capturing screenshot…"))
-            self._link_label.hide()
-            return
-        if status == "ocr_missing":
-            self._body.setText(data.get("detail", "Install OCR: pip install .[ocr]"))
-            self._link_label.hide()
-            return
-        if status == "error":
-            self._body.setText(data.get("detail", "Unknown error"))
-            self._link_label.hide()
-            return
+
+        self._status_label.hide()
+        self._card_widget.show()
 
         tcg_name = (data.get("tcg_name") or "").strip()
         ocr_name = (data.get("ocr_name") or "").strip()
         collector = (data.get("collector_number") or "").strip()
         card_number = (data.get("card_number") or "").strip()
         display_number = card_number or collector or ""
-        display_name = tcg_name or ocr_name or "—"
+        rarity = (data.get("rarity") or "").strip()
+        market = (data.get("market") or "").strip()
+
+        self._set_status_dot("ok" if tcg_name else "warn")
+
+        # Thumbnail of the actual captured/warped crop.
+        frame = data.get("warp_frame")
+        if frame is not None:
+            try:
+                self._thumb_label.setPixmap(_rounded_pixmap(_bgr_to_pixmap(frame, 92, 128), 8))
+            except Exception:
+                pass
+
+        # Condition grid — real NM/LP/MP/HP/DM prices from JustTCG when available.
+        conditions: dict[str, float | None] = data.get("condition_prices") or {}
+        for code, btn in self._condition_buttons.items():
+            price = conditions.get(code)
+            btn.setText(f"{code}\n{f'${price:.2f}' if price is not None else '—'}")
+            btn.setEnabled(price is not None)
+
+        if conditions.get(self._selected_condition) is None:
+            fallback = next((c for c in CONDITION_ORDER if conditions.get(c) is not None), None)
+            if fallback:
+                self._selected_condition = fallback
+                self._condition_buttons[fallback].setChecked(True)
+
+        selected_price = conditions.get(self._selected_condition)
+        if selected_price is not None:
+            price_text = f"${selected_price:.2f}"
+        elif market and market != "—":
+            price_text = market if market.startswith("$") else f"${market}"
+        else:
+            price_text = "—"
+        self._price_label.setText(price_text)
+        self._price_label.setStyleSheet(f"color: {'#3ddc84' if price_text != '—' else '#666'};")
+        self._condition_caption.setText(
+            _CONDITION_CAPTIONS.get(self._selected_condition, "NEAR MINT")
+        )
+
+        source = (data.get("price_source") or "").strip()
+        lookup_ms = data.get("lookup_ms") or 0
+        if source:
+            self._source_caption.setText(f"via {source} · {lookup_ms}ms")
+            self._source_caption.show()
+        else:
+            self._source_caption.hide()
+
+        change = data.get("price_change_24h")
+        if isinstance(change, (int, float)):
+            if change > 0:
+                arrow, color = "▲", "#3ddc84"
+            elif change < 0:
+                arrow, color = "▼", "#e0744d"
+            else:
+                arrow, color = "■", "#8a8a98"
+            self._change_label.setText(f"{arrow} {abs(change):.1f}% 24h")
+            self._change_label.setStyleSheet(f"color: {color};")
+            self._change_label.show()
+        else:
+            self._change_label.hide()
+
+        self._name_label.setText(tcg_name or ocr_name or "—")
+        self._set_label.setText((data.get("set_name") or "").strip() or "—")
+        bits = []
         if display_number:
-            display_name = f"{display_name}  ({display_number})"
-        display_set = (data.get("set_name") or "").strip() or "—"
-        market = (data.get("market") or "").strip() or "—"
-        if market != "—" and not market.startswith("$"):
-            market = f"${market}"
+            bits.append(f"#{display_number}")
+        if rarity:
+            bits.append(rarity)
+        self._number_label.setText(" · ".join(bits))
 
-        foil_pref = (data.get("foil_guess") or "Normal").strip()
-        listing_print = (data.get("printing") or "").strip()
-        if listing_print:
-            foil_line = f"Printing: {foil_pref} · {listing_print} (listing)"
+        conf_label, conf_color = _confidence_label(data)
+        self._confidence_tag.setText(conf_label)
+        self._confidence_tag.setStyleSheet(
+            _pill_style(conf_color, _CONFIDENCE_BG.get(conf_color, "#2a2a34"))
+        )
+
+        tier_label = _price_tier_label(market)
+        if tier_label:
+            self._tier_tag.setText(f"● {tier_label}")
+            self._tier_tag.show()
         else:
-            foil_line = f"Printing: {foil_pref}"
+            self._tier_tag.hide()
 
-        lines = [
-            f"Name: {display_name}",
-            f"Set: {display_set}",
-            foil_line,
-            f"NM market: {market}",
-        ]
+        printing = (data.get("printing") or data.get("foil_guess") or "Normal").strip()
+        self._conditions_caption.setText(f"CONDITIONS · {printing.upper()}")
 
-        vision_label = (data.get("vision_label") or "").strip()
-        if vision_label:
-            lines.append(f"Vision: {self._truncate_line(vision_label, 60)}  ✓")
+        tcgplayer_id = (data.get("tcgplayer_id") or "").strip()
+        url = (data.get("vision_tcgplayer_url") or "").strip() or self._sticky_tcgplayer_url
+        if not url and tcgplayer_id:
+            url = f"https://www.tcgplayer.com/product/{tcgplayer_id}"
+        self._view_url = url
+        self._view_btn.setEnabled(bool(url))
 
+        detail = (data.get("detail") or "").strip()
         stage = (data.get("lookup_stage") or "").strip()
-        if stage and not tcg_name:
-            lines.append(stage)
-        if data.get("detail"):
-            lines.append(self._truncate_line(str(data["detail"]), 72))
-
-        ocr_raw = (data.get("ocr_lines") or "").strip()
-        if ocr_raw and not tcg_name and not vision_label:
-            lines.append(f"OCR: {self._truncate_line(ocr_raw, 64)}")
-
-        self._body.setText("\n".join(lines))
-
-        # Use current snapshot URL when available; fall back to sticky URL from last good result.
-        tcgplayer_url = (data.get("vision_tcgplayer_url") or "").strip() or self._sticky_tcgplayer_url
-        if tcgplayer_url:
-            short_url = tcgplayer_url
-            if len(short_url) > 60:
-                short_url = short_url[:57] + "…"
-            self._link_label.setText(
-                f'TCGPlayer: <a href="{tcgplayer_url}" style="color:#6ab0f5;">'
-                f"{short_url}</a>"
-            )
-            self._link_label.show()
-        else:
-            self._link_label.hide()
+        note = detail or (stage if not tcg_name else "")
+        if not note and not source and not self._settings.justtcg_api_key:
+            note = "Set JUSTTCG_API_KEY for LP/MP/HP/DM prices"
+        scans = self._scan_count
+        tier = "JUSTTCG" if self._settings.justtcg_api_key else "BASIC"
+        status_line = f"{scans} SCAN{'S' if scans != 1 else ''} THIS SESSION  ·  {tier}  ·  v{__version__}"
+        self._footer_label.setText(self._truncate_line(note, 56) if note else status_line)
 
 
 def run_app() -> int:
@@ -981,10 +1397,31 @@ def run_app() -> int:
     app.setQuitOnLastWindowClosed(False)
     settings = Settings.from_env()
 
+    # Without macOS Screen Recording permission, every grab silently returns
+    # the desktop wallpaper instead of the browser window underneath — no
+    # error, no exception, it just looks like the app is "screenshotting the
+    # desktop". Catch that here instead of leaving the user to guess why.
+    if has_screen_recording_access() is False:
+        request_screen_recording_access()
+        QMessageBox.warning(
+            None,
+            "Screen Recording permission needed",
+            "macOS is blocking this app from seeing your browser window.\n\n"
+            "Without Screen Recording permission, every scan just captures your "
+            "desktop wallpaper instead of the card on screen — that's why the "
+            "thumbnail looks wrong.\n\n"
+            "Fix: open System Settings -> Privacy & Security -> Screen Recording, "
+            "enable the terminal/app you used to launch this program, then fully "
+            "quit and relaunch it (just checking the box isn't enough — the app "
+            "has to restart).",
+        )
+
     overlay: OverlayWindow | None = None
     picker_ref: RegionPicker | None = None
 
-    scan_region: Region | None = None
+    # Reuse the last-picked region automatically if it still fits the current
+    # monitor layout, so the picker only needs to run once per machine setup.
+    scan_region: Region | None = load_region()
 
     def _open_overlay() -> None:
         nonlocal overlay
@@ -1002,6 +1439,7 @@ def run_app() -> int:
     def _on_region(left: int, top: int, width: int, height: int) -> None:
         nonlocal scan_region
         scan_region = Region(left=left, top=top, width=width, height=height)
+        save_region(scan_region)
         if overlay is not None:
             overlay.update_region(scan_region)
             overlay.show()
@@ -1025,5 +1463,8 @@ def run_app() -> int:
         picker_ref.cancelled.connect(_on_cancel)
         picker_ref.show()
 
-    _show_picker()
+    if scan_region is not None:
+        _open_overlay()
+    else:
+        _show_picker()
     return app.exec()

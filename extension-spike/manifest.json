@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "WPC Capture Spike (throwaway)",
+  "version": "0.0.1",
+  "description": "Diagnostic-only: tests whether Whatnot's stream <video> element can be read via canvas (not CORS-tainted). Not the real extension.",
+  "content_scripts": [
+    {
+      "matches": ["https://www.whatnot.com/*", "https://whatnot.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

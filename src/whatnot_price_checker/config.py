@@ -58,6 +58,10 @@ class Settings:
     tcgplayer_access_token: str | None = None
     tcg_api_version: str = "1.39.0"
 
+    # JustTCG (optional — only source that provides real per-condition
+    # NM/LP/MP/HP/DM prices for the overlay's condition grid).
+    justtcg_api_key: str | None = None
+
     @classmethod
     def from_env(cls) -> Settings:
         _load_dotenv_files()
@@ -78,4 +82,5 @@ class Settings:
             tcgplayer_private_key=os.environ.get("TCGPLAYER_PRIVATE_KEY"),
             tcgplayer_access_token=os.environ.get("TCGPLAYER_ACCESS_TOKEN"),
             tcg_api_version=os.environ.get("WPC_TCG_API_VERSION", cls.tcg_api_version),
+            justtcg_api_key=os.environ.get("JUSTTCG_API_KEY"),
         )
